@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Advens
 # Makefile.dev: local inner-loop for the rsyslog mmsigma glue.
 # The engine (match, correlator, CLI, fuzz) lives in libsigma.
 #
@@ -5,7 +7,7 @@
 #   make -f Makefile.dev module-check
 #   make -f Makefile.dev test          # ecs_derive only; engine tests via matcher
 #
-# Author: Jeremie Jourdin <jeremie.jourdin@advens.fr>  (Apache-2.0)
+# Author: Jeremie Jourdin <jeremie.jourdin@advens.fr>
 
 CC      ?= clang
 CSTD    := -std=c11

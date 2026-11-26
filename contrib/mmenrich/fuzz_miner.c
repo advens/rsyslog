@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* fuzz_miner.c
  * Differential fuzz harness proving the mmenrich SIMD IOC miner
  * (mine_iocs_simd) is bit-identical to the scalar reference

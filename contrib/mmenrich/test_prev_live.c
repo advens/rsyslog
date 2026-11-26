@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Copyright 2026 Advens */
+
 /* Standalone checks for the prevalence counter file and its publisher.
  * Compile beside prev_live.c; the image is read back with prev_lookup.
  */

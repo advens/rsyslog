@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Copyright 2026 Advens */
+
 /* test_thrt_ua.c: UA table and classifiers. */
 #include "thrt_ua.h"
 #include <stdio.h>

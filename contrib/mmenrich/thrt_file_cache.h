@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* thrt_file_cache.h: process-wide inode-keyed snapshot cache.
  *
  * Several mmenrich actions on one rsyslog process typically name the same

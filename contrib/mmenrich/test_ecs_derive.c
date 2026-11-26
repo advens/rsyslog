@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* test_ecs_derive.c: the ECS derive contract: transforms and table shape.
  *
  * Copyright 2026 Advens.

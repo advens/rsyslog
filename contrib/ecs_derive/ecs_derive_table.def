@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Copyright 2026 Advens */
+
 /* ecs_derive_table.def: the ONE declarative ECS derived-field contract.
  *
  * X-macro table for the C derive layer (ecs_derive.h): the single declarative

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* test_file_cache.c: inode-keyed snapshot cache (process-wide CTI maps).
  *
  * Build: cc -O2 -pthread -I. thrt_file_cache.c test_file_cache.c -o test_file_cache

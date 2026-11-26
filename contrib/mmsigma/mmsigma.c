@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* mmsigma.c
  * rsyslog message-modification module: evaluate compiled Sigma selection-match
  * rules (a `.sigmac` artifact) against each message's parsed fields and inject

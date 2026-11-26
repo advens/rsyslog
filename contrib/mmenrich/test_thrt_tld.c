@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Copyright 2026 Advens */
+
 /* test_thrt_tld.c: TLD table + uncommon classifier. */
 #include "thrt_tld.h"
 #include <stdio.h>

@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Copyright 2026 Advens */
+
 /* JSON written for one lookup result. Category words must not contain one
  * another, the strictest TLP word is the one a term comparison sees, a feed
  * join keeps every selected name so a contains test can see TOR, CTI labels

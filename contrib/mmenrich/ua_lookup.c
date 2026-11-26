@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* ua_lookup.c
  * Load a ua.json catalog and classify a User-Agent string.
  *

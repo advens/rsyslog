@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* thrt_ua.h
  * User-agent identification table. Exact case-insensitive lookup,
  * then a contains automaton and prefix and suffix compares. Empty and a

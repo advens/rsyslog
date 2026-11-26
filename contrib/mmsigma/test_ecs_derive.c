@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* test_ecs_derive.c
  * Self-test for the shared ECS derived-field layer (runtime/ecs_derive.h):
  * the SLICE transforms (url.path), the COMPUTED DGA numeric features (Shannon

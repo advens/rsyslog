@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* test_thrt_payload.c
  * Shared payload classification helpers (thrt_payload.h).
  *

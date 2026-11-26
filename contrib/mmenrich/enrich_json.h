@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* enrich_json.h
  * JSON for one libenrich lookup result: the per-field object and the party
  * scalars mmenrich writes into the message.

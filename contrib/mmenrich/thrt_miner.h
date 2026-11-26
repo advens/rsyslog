@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* thrt_miner.h
  * Pattern-based IOC miner for mmenrich: extracts IP, domain, email, hash,
  * file and escaped-payload tokens from raw message text. Zero-copy: each

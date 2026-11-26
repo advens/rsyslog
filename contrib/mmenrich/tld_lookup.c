@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* tld_lookup.c
  * Load a tld.json catalog and classify a domain's last label.
  *

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* ecs_derive.h
  * ECS-native derived-field layer (header-only). Derives canonical Elastic
  * Common Schema sub-fields from a parsed primary field, the way an Elastic

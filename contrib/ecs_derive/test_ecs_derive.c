@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Copyright 2026 Advens */
+
 /* test_ecs_derive.c: standalone unit test for the ECS derive layer.
  * Builds with: cc -std=c11 -I. -o /tmp/t test_ecs_derive.c && /tmp/t
  * No rsyslog/liblognorm deps: pure logic test of ecs_derive.h. */

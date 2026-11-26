@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* thrt_payload.h
  * Payload classification helpers: URL extension extraction, escaped-payload
  * detection, and file-extension classification. The IOC miner and any other

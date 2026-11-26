@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* thrt_tld.h
  * TLD identification table. Exact case-insensitive last-label lookup.
  * Table hit: common / suspicious. Miss with a present domain: uncommon.

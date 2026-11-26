@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Advens
 """Writer for the prevalence lookup table (.prev), the C-reader contract.
 
 Mirrors prev_format.h BYTE-FOR-BYTE: the same keyed SipHash-1-3, the same

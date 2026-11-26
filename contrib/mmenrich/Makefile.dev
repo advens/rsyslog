@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Advens
 # Makefile.dev: local (macOS/Linux) inner-loop compile-check for mmenrich,
 # the log-enrichment rsyslog module. This is NOT the
 # rsyslog build: it only syntax-checks the module glue (mmenrich.c) against a
@@ -20,7 +22,7 @@
 # The .thrt headers come from a libenrich source tree: set ENRICH_SRC to its
 # src/ directory.
 #
-# Author: Jérémie Jourdin - <jeremie.jourdin@advens.fr>  (LGPL-3.0-or-later)
+# Author: Jérémie Jourdin - <jeremie.jourdin@advens.fr>
 
 CC      ?= clang
 

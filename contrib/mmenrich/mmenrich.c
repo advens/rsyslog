@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
 /* mmenrich.c
  * This is a message modification module providing line-rate log enrichment.
  * It emits enrichment facts (CTI indicator lookup, GeoIP/ASN geolocation, CTI
