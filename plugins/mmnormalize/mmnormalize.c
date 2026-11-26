@@ -89,8 +89,8 @@ static rsRetVal resetConfigVariables(uchar __attribute__((unused)) * pp, void __
 /* internal structures
  */
 DEF_OMOD_STATIC_DATA;
-#ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
 DEFobjCurrIf(statsobj)
+#ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
     /* Module-level impstats. turbo.truncated counts messages for which the
      * TurboVM result hit a per-result capacity and was therefore declined: the
      * standard parser produced the fields instead. It is a cost signal, not a
@@ -102,6 +102,28 @@ STATSCOUNTER_DEF(ctrTurboTruncated, mutCtrTurboTruncated)
 static struct cnfparamdescr modpdescr[] = {{"allowregex", eCmdHdlrBinary, 0}};
 
 static struct cnfparamblk modpblk = {CNFPARAMBLK_VERSION, sizeof(modpdescr) / sizeof(struct cnfparamdescr), modpdescr};
+
+/* Per-action impstats, built only when statsName is set. Each counter keeps
+ * its own atomic helper so the no-atomics fallback stays correct. */
+typedef struct normCounter_s {
+    STATSCOUNTER_DEF(n, mut)
+} normCounter_t;
+
+enum {
+    NORM_CTR_PARSED, /* a rule matched, by either parser */
+    NORM_CTR_FAILED, /* no rule matched */
+    NORM_CTR_TURBO_PARSED, /* the Turbo result was used */
+    NORM_CTR_TURBO_FALLBACK_PARSED, /* Turbo matched nothing, the standard parser matched */
+    NORM_CTR_TURBO_TRUNCATED, /* Turbo result declined because it was truncated */
+    NORM_CTR_COUNT
+};
+
+static const char *const normCtrName[NORM_CTR_COUNT] = {"parsed", "failed", "turbo.parsed", "turbo.fallback.parsed",
+                                                        "turbo.truncated"};
+
+#define NORM_STATS_NAME_MAX 128
+#define NORM_STATS_TAGS_MAX 8
+#define NORM_STATS_TAG_MAX 64
 
 typedef struct _instanceData {
     sbool bUseRawMsg; /**< use %rawmsg% instead of %msg% */
@@ -123,6 +145,12 @@ typedef struct _instanceData {
 #ifdef HAVE_LOGNORM_TURBO
     sbool bTurbo; /**< user requested turbo mode */
 #endif
+    uchar *statsName; /**< impstats object suffix, NULL for no per-action stats */
+    statsobj_t *stats; /**< mmnormalize(<statsName>), NULL when statsName is unset */
+    normCounter_t ctr[NORM_CTR_COUNT];
+    int nStatsTags; /**< entries in statsTag[] */
+    char *statsTag[NORM_STATS_TAGS_MAX]; /**< rule tags counted on a Turbo match */
+    normCounter_t tagCtr[NORM_STATS_TAGS_MAX];
 } instanceData;
 
 typedef struct wrkrInstanceData {
@@ -149,6 +177,7 @@ static struct cnfparamdescr actpdescr[] = {
 #ifdef HAVE_LOGNORM_TURBO
     {"turbo", eCmdHdlrBinary, 0},
 #endif
+    {"statsname", eCmdHdlrGetWord, 0}, {"statstags", eCmdHdlrArray, 0},
 };
 static struct cnfparamblk actpblk = {CNFPARAMBLK_VERSION, sizeof(actpdescr) / sizeof(struct cnfparamdescr), actpdescr};
 
@@ -402,6 +431,9 @@ BEGINfreeInstance
     msgPropDescrDestruct(pData->varDescr);
     free(pData->varDescr);
     if (pData->debugFile != NULL) fclose(pData->debugFile);
+    if (pData->stats != NULL) statsobj.Destruct(&pData->stats);
+    for (int i = 0; i < pData->nStatsTags; ++i) free(pData->statsTag[i]);
+    free(pData->statsName);
 ENDfreeInstance
 
 
@@ -702,6 +734,30 @@ static void refreshTurboContext(wrkrInstanceData_t *const pWrkrData) {
 #endif
 
 
+static inline void normCount(normCounter_t *const c) {
+    STATSCOUNTER_INC(c->n, c->mut);
+}
+
+#ifdef HAVE_LOGNORM_TURBO
+/* A Turbo result was used for this message: count it and the configured tags
+ * its rule carries. The tag list is short and fixed at config load. */
+static void countTurboParsed(instanceData *const pData, const ln_fast_result_t *const result) {
+    const int ntags = pData->nStatsTags > 0 ? ln_fast_result_tag_count(result) : 0;
+
+    normCount(&pData->ctr[NORM_CTR_TURBO_PARSED]);
+    for (int i = 0; i < ntags; ++i) {
+        const char *const tag = ln_fast_result_get_tag(result, i);
+        if (tag == NULL) continue;
+        for (int j = 0; j < pData->nStatsTags; ++j) {
+            if (strcmp(tag, pData->statsTag[j]) == 0) {
+                normCount(&pData->tagCtr[j]);
+                break;
+            }
+        }
+    }
+}
+#endif
+
 BEGINdoAction_NoStrings
     smsg_t **ppMsg = (smsg_t **)pMsgData;
     smsg_t *pMsg = ppMsg[0];
@@ -710,6 +766,9 @@ BEGINdoAction_NoStrings
     int r;
     struct json_object *json = NULL;
     unsigned short freeBuf = 0;
+#ifdef HAVE_LOGNORM_TURBO
+    sbool turboMiss = 0; /* Turbo ran and no rule matched */
+#endif
     CODESTARTdoAction;
     if (pWrkrData->pData->bUseRawMsg) {
         getRawMsg(pMsg, &buf, &len);
@@ -735,6 +794,7 @@ BEGINdoAction_NoStrings
          * a message the standard parser went on to parse in full anyway. */
         if (r == 0 && result != NULL && ln_fast_result_is_truncated(result)) {
             STATSCOUNTER_INC(ctrTurboTruncated, mutCtrTurboTruncated);
+            if (pWrkrData->pData->stats != NULL) normCount(&pWrkrData->pData->ctr[NORM_CTR_TURBO_TRUNCATED]);
             DBGPRINTF(
                 "mmnormalize: turbo result truncated, "
                 "falling back to standard normalization\n");
@@ -755,7 +815,10 @@ BEGINdoAction_NoStrings
                         "mmnormalize: turbo snapshot alloc failed, "
                         "trying JSON materialization\n");
                     json = fast_result_to_json(result);
-                    if (json != NULL) goto add_json;
+                    if (json != NULL) {
+                        if (pWrkrData->pData->stats != NULL) countTurboParsed(pWrkrData->pData, result);
+                        goto add_json;
+                    }
                     DBGPRINTF(
                         "mmnormalize: turbo JSON materialization failed, "
                         "falling back to standard normalization\n");
@@ -773,6 +836,10 @@ BEGINdoAction_NoStrings
                     pMsg->turbo_result_get_str = turbo_result_get_str_cb;
                     MsgSetParseSuccess(pMsg, 1);
                     MsgUnlock(pMsg);
+                    if (pWrkrData->pData->stats != NULL) {
+                        normCount(&pWrkrData->pData->ctr[NORM_CTR_PARSED]);
+                        countTurboParsed(pWrkrData->pData, result);
+                    }
                     goto turbo_done;
                 }
             }
@@ -781,9 +848,13 @@ BEGINdoAction_NoStrings
              * through to standard normalization rather than retrying Turbo. */
             if (!isCeeRoot) {
                 json = fast_result_to_json(result);
-                if (json != NULL) goto add_json;
+                if (json != NULL) {
+                    if (pWrkrData->pData->stats != NULL) countTurboParsed(pWrkrData->pData, result);
+                    goto add_json;
+                }
             }
         } else {
+            turboMiss = (r != 0 || result == NULL);
             DBGPRINTF(
                 "mmnormalize: turbo normalize failed (r=%d), "
                 "falling back to standard\n",
@@ -805,6 +876,12 @@ add_json:
         MsgSetParseSuccess(pMsg, 0);
     } else {
         MsgSetParseSuccess(pMsg, 1);
+    }
+    if (pWrkrData->pData->stats != NULL) {
+        normCount(&pWrkrData->pData->ctr[r == 0 ? NORM_CTR_PARSED : NORM_CTR_FAILED]);
+#ifdef HAVE_LOGNORM_TURBO
+        if (r == 0 && turboMiss) normCount(&pWrkrData->pData->ctr[NORM_CTR_TURBO_FALLBACK_PARSED]);
+#endif
     }
 
     msgAddJSON(pMsg, (uchar *)pWrkrData->pData->pszPath + 1, json, 0, 0);
@@ -834,6 +911,89 @@ static void setInstParamDefaults(instanceData *pData) {
 #ifdef HAVE_LOGNORM_TURBO
     pData->bTurbo = 0;
 #endif
+    pData->statsName = NULL;
+    pData->stats = NULL;
+    pData->nStatsTags = 0;
+}
+
+/* Names end up in impstats output and in downstream metric names. Keep them
+ * to a conservative character set so no output format needs escaping. */
+static int statsNameIsValid(const char *const name, const size_t maxLen) {
+    const size_t len = strlen(name);
+
+    if (len == 0 || len > maxLen) return 0;
+    for (size_t i = 0; i < len; ++i) {
+        const char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+              c == '.'))
+            return 0;
+    }
+    return 1;
+}
+
+static rsRetVal setStatsTags(instanceData *const pData, struct cnfarray *const ar) {
+    DEFiRet;
+
+    if (ar->nmemb > NORM_STATS_TAGS_MAX) {
+        LogError(0, RS_RET_CONFIG_ERROR, "mmnormalize: statsTags accepts at most %d tags", NORM_STATS_TAGS_MAX);
+        ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+    }
+    for (int i = 0; i < ar->nmemb; ++i) {
+        char *const tag = es_str2cstr(ar->arr[i], NULL);
+        CHKmalloc(tag);
+        if (!statsNameIsValid(tag, NORM_STATS_TAG_MAX)) {
+            LogError(0, RS_RET_CONFIG_ERROR,
+                     "mmnormalize: statsTags entry '%s' must be 1 to %d characters of "
+                     "[A-Za-z0-9_.-]",
+                     tag, NORM_STATS_TAG_MAX);
+            free(tag);
+            ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+        }
+        for (int j = 0; j < pData->nStatsTags; ++j) {
+            if (strcmp(tag, pData->statsTag[j]) == 0) {
+                LogError(0, RS_RET_CONFIG_ERROR, "mmnormalize: statsTags lists '%s' twice", tag);
+                free(tag);
+                ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+            }
+        }
+        pData->statsTag[pData->nStatsTags++] = tag;
+    }
+finalize_it:
+    RETiRet;
+}
+
+/* Build mmnormalize(<statsName>). The Turbo counters are registered only for
+ * an action that asked for Turbo, so a standard-only action shows two. */
+static rsRetVal buildInstanceStats(instanceData *const pData) {
+    char name[sizeof("mmnormalize()") + NORM_STATS_NAME_MAX];
+    char ctrName[sizeof("parsed.") + NORM_STATS_TAG_MAX];
+    int nCtr = NORM_CTR_TURBO_PARSED;
+    DEFiRet;
+
+#ifdef HAVE_LOGNORM_TURBO
+    if (pData->bTurbo) nCtr = NORM_CTR_COUNT;
+    #ifndef HAVE_LN_FAST_RESULT_IS_TRUNCATED
+    if (pData->bTurbo) nCtr = NORM_CTR_TURBO_TRUNCATED;
+    #endif
+#endif
+    snprintf(name, sizeof(name), "mmnormalize(%s)", (const char *)pData->statsName);
+    CHKiRet(statsobj.Construct(&pData->stats));
+    CHKiRet(statsobj.SetName(pData->stats, (uchar *)name));
+    CHKiRet(statsobj.SetOrigin(pData->stats, (uchar *)"mmnormalize"));
+    for (int i = 0; i < nCtr; ++i) {
+        STATSCOUNTER_INIT(pData->ctr[i].n, pData->ctr[i].mut);
+        CHKiRet(statsobj.AddCounter(pData->stats, (const uchar *)normCtrName[i], ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                    &pData->ctr[i].n));
+    }
+    for (int i = 0; i < pData->nStatsTags; ++i) {
+        snprintf(ctrName, sizeof(ctrName), "parsed.%s", pData->statsTag[i]);
+        STATSCOUNTER_INIT(pData->tagCtr[i].n, pData->tagCtr[i].mut);
+        CHKiRet(statsobj.AddCounter(pData->stats, (uchar *)ctrName, ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                    &pData->tagCtr[i].n));
+    }
+    CHKiRet(statsobj.ConstructFinalize(pData->stats));
+finalize_it:
+    RETiRet;
 }
 
 BEGINsetModCnf
@@ -879,6 +1039,7 @@ BEGINnewActInst
     char *buffer;
     char *tStr;
     char *debugFileName = NULL;
+    struct cnfarray *statsTags = NULL;
     int size = 0;
     CODESTARTnewActInst;
     DBGPRINTF("newActInst (mmnormalize)\n");
@@ -939,6 +1100,10 @@ BEGINnewActInst
         } else if (!strcmp(actpblk.descr[i].name, "turbo")) {
             pData->bTurbo = (int)pvals[i].val.d.n;
 #endif
+        } else if (!strcmp(actpblk.descr[i].name, "statsname")) {
+            CHKmalloc(pData->statsName = (uchar *)es_str2cstr(pvals[i].val.d.estr, NULL));
+        } else if (!strcmp(actpblk.descr[i].name, "statstags")) {
+            statsTags = pvals[i].val.d.ar;
         } else if (!strcmp(actpblk.descr[i].name, "path")) {
             CHKmalloc(cstr = es_str2cstr(pvals[i].val.d.estr, NULL));
             if (strlen(cstr) < 2) {
@@ -1004,6 +1169,22 @@ BEGINnewActInst
                      "mmnormalize: only one rulebase possible, rulebase "
                      "can't be used with rule");
         }
+    }
+
+    if (statsTags != NULL && pData->statsName == NULL) {
+        LogError(0, RS_RET_CONFIG_ERROR, "mmnormalize: 'statsTags' requires 'statsName'");
+        ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+    }
+    if (pData->statsName != NULL) {
+        if (!statsNameIsValid((const char *)pData->statsName, NORM_STATS_NAME_MAX)) {
+            LogError(0, RS_RET_CONFIG_ERROR,
+                     "mmnormalize: statsName '%s' must be 1 to %d characters of "
+                     "[A-Za-z0-9_.-]",
+                     pData->statsName, NORM_STATS_NAME_MAX);
+            ABORT_FINALIZE(RS_RET_CONFIG_ERROR);
+        }
+        if (statsTags != NULL) CHKiRet(setStatsTags(pData, statsTags));
+        CHKiRet(buildInstanceStats(pData));
     }
 
     CODE_STD_STRING_REQUESTnewActInst(1);
@@ -1099,8 +1280,8 @@ BEGINmodExit
     CODESTARTmodExit;
 #ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
     if (mmnormalizeStats != NULL) statsobj.Destruct(&mmnormalizeStats);
-    objRelease(statsobj, CORE_COMPONENT);
 #endif
+    objRelease(statsobj, CORE_COMPONENT);
 ENDmodExit
 
 
@@ -1168,8 +1349,8 @@ BEGINmodInit()
                                STD_LOADABLE_MODULE_ID));
     CHKiRet(omsdRegCFSLineHdlr((uchar *)"resetconfigvariables", 1, eCmdHdlrCustomHandler, resetConfigVariables, NULL,
                                STD_LOADABLE_MODULE_ID));
-#ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
     CHKiRet(objUse(statsobj, CORE_COMPONENT));
+#ifdef HAVE_LN_FAST_RESULT_IS_TRUNCATED
     CHKiRet(statsobj.Construct(&mmnormalizeStats));
     CHKiRet(statsobj.SetName(mmnormalizeStats, (uchar *)"mmnormalize"));
     CHKiRet(statsobj.SetOrigin(mmnormalizeStats, (uchar *)"mmnormalize"));

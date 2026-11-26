@@ -104,6 +104,14 @@ Action Parameters
      - .. include:: ../../reference/parameters/mmnormalize-turbo.rst
         :start-after: .. summary-start
         :end-before: .. summary-end
+   * - :ref:`param-mmnormalize-statsname`
+     - .. include:: ../../reference/parameters/mmnormalize-statsname.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
+   * - :ref:`param-mmnormalize-statstags`
+     - .. include:: ../../reference/parameters/mmnormalize-statstags.rst
+        :start-after: .. summary-start
+        :end-before: .. summary-end
    * - :ref:`param-mmnormalize-debug`
      - .. include:: ../../reference/parameters/mmnormalize-debug.rst
         :start-after: .. summary-start
@@ -123,6 +131,8 @@ Action Parameters
    ../../reference/parameters/mmnormalize-path
    ../../reference/parameters/mmnormalize-variable
    ../../reference/parameters/mmnormalize-turbo
+   ../../reference/parameters/mmnormalize-statsname
+   ../../reference/parameters/mmnormalize-statstags
    ../../reference/parameters/mmnormalize-debug
    ../../reference/parameters/mmnormalize-debugfile
 

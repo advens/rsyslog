@@ -2204,7 +2204,9 @@ TESTS_MMNORMALIZE_TURBO_OMRULESET = \
 	mmnormalize-turbo-msgdup-concurrent-tsan.sh
 
 TESTS_MMNORMALIZE_TURBO_IMPSTATS = \
-	mmnormalize-turbo-truncated-stat.sh
+	mmnormalize-turbo-truncated-stat.sh \
+	mmnormalize-turbo-instance-stats.sh \
+	mmnormalize-statsname-invalid.sh
 
 TESTS_MMNORMALIZE_TURBO_YAML = \
 	yaml-mmnormalize-turbo.sh
