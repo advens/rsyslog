@@ -28,7 +28,11 @@
  * for a name it contains. The merged header's reporting_edges is the
  * number of files that were fresh enough to include.
  */
+#ifdef HAVE_CONFIG_H
+    #include "config.h"
+#endif
 #include "prev_live.h"
+#include "mmenrich_atomic.h"
 
 #include "prev_format.h"
 
@@ -112,7 +116,7 @@ static prev_live_slot_t *prev_live_slots(prev_live_t *live) {
 }
 
 static uint32_t prev_now(prev_live_t *live) {
-    uint32_t now = __atomic_load_n(&live->now_sec, __ATOMIC_RELAXED);
+    uint32_t now = MMENRICH_ATOMIC_LOAD(&live->now_sec, __ATOMIC_RELAXED);
     if (now == 0) now = (uint32_t)time(NULL);
     return now;
 }
@@ -134,11 +138,11 @@ static prev_live_slot_t *prev_live_probe(prev_live_t *live, uint64_t key, int cr
 
     for (n = 0; n < PREV_LIVE_PROBE; n++) {
         prev_live_slot_t *slot = &slots[idx];
-        uint64_t cur = __atomic_load_n(&slot->key, __ATOMIC_ACQUIRE);
+        uint64_t cur = MMENRICH_ATOMIC_LOAD(&slot->key, __ATOMIC_ACQUIRE);
         if (cur == key) return slot;
         if (cur == 0) {
             if (!create) return NULL;
-            if (__atomic_compare_exchange_n(&slot->key, &cur, key, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return slot;
+            if (MMENRICH_ATOMIC_CAS(&slot->key, &cur, key, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return slot;
             continue; /* lost the empty row, look again */
         }
         idx = (idx + 1u) & mask;
@@ -157,9 +161,9 @@ static void prev_note_source(const prev_live_t *live, prev_live_slot_t *slot, co
         int free_idx = -1;
         int i;
         for (i = 0; i < (int)PREV_LIVE_SRCS; i++) {
-            uint32_t cur = __atomic_load_n(&slot->src_hash[i], __ATOMIC_ACQUIRE);
+            uint32_t cur = MMENRICH_ATOMIC_LOAD(&slot->src_hash[i], __ATOMIC_ACQUIRE);
             if (cur == sh) {
-                __atomic_store_n(&slot->src_sec[i], now, __ATOMIC_RELAXED);
+                MMENRICH_ATOMIC_STORE(&slot->src_sec[i], now, __ATOMIC_RELAXED);
                 return;
             }
             if (cur == 0 && free_idx < 0) free_idx = i;
@@ -167,9 +171,8 @@ static void prev_note_source(const prev_live_t *live, prev_live_slot_t *slot, co
         if (free_idx < 0) return; /* eight distinct sources: the lte-2 gate is already false */
         {
             uint32_t expected = 0;
-            if (__atomic_compare_exchange_n(&slot->src_hash[free_idx], &expected, sh, 0, __ATOMIC_RELEASE,
-                                            __ATOMIC_RELAXED)) {
-                __atomic_store_n(&slot->src_sec[free_idx], now, __ATOMIC_RELAXED);
+            if (MMENRICH_ATOMIC_CAS(&slot->src_hash[free_idx], &expected, sh, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+                MMENRICH_ATOMIC_STORE(&slot->src_sec[free_idx], now, __ATOMIC_RELAXED);
                 return;
             }
         }
@@ -179,14 +182,14 @@ static void prev_note_source(const prev_live_t *live, prev_live_slot_t *slot, co
 static void prev_add_count(prev_live_slot_t *slot) {
     uint32_t c;
     do {
-        c = __atomic_load_n(&slot->count_cur, __ATOMIC_RELAXED);
+        c = MMENRICH_ATOMIC_LOAD(&slot->count_cur, __ATOMIC_RELAXED);
         if (c == UINT32_MAX) return;
-    } while (!__atomic_compare_exchange_n(&slot->count_cur, &c, c + 1u, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    } while (!MMENRICH_ATOMIC_CAS(&slot->count_cur, &c, c + 1u, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
 }
 
 void prev_live_tick(prev_live_t *live, uint32_t now_sec) {
     if (live == NULL || now_sec == 0) return;
-    __atomic_store_n(&live->now_sec, now_sec, __ATOMIC_RELAXED);
+    MMENRICH_ATOMIC_STORE(&live->now_sec, now_sec, __ATOMIC_RELAXED);
 }
 
 void prev_live_note(prev_live_t *live, const char *observable, const char *source_ip) {
@@ -197,12 +200,12 @@ void prev_live_note(prev_live_t *live, const char *observable, const char *sourc
     key = prev_key(live, observable);
     slot = prev_live_probe(live, key, 1);
     if (slot == NULL) {
-        __atomic_fetch_add(&live->drops, 1, __ATOMIC_RELAXED);
+        MMENRICH_ATOMIC_FETCH_ADD(&live->drops, 1, __ATOMIC_RELAXED);
         return;
     }
     prev_add_count(slot);
     prev_note_source(live, slot, source_ip, prev_now(live));
-    __atomic_fetch_add(&live->notes, 1, __ATOMIC_RELAXED);
+    MMENRICH_ATOMIC_FETCH_ADD(&live->notes, 1, __ATOMIC_RELAXED);
 }
 
 int prev_live_put(prev_live_t *live, uint64_t key, uint32_t count, uint16_t edges, uint16_t sources) {
@@ -214,14 +217,12 @@ int prev_live_put(prev_live_t *live, uint64_t key, uint32_t count, uint16_t edge
     slot = prev_live_probe(live, key, 1);
     if (slot == NULL) return -1;
     prev = 0;
-    (void)__atomic_compare_exchange_n(&slot->count_prev, &prev, count, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    (void)MMENRICH_ATOMIC_CAS(&slot->count_prev, &prev, count, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
     {
         uint32_t z = 0;
-        (void)__atomic_compare_exchange_n(&slot->edge_floor, &z, (uint32_t)edges, 0, __ATOMIC_RELAXED,
-                                          __ATOMIC_RELAXED);
+        (void)MMENRICH_ATOMIC_CAS(&slot->edge_floor, &z, (uint32_t)edges, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
         z = 0;
-        (void)__atomic_compare_exchange_n(&slot->src_floor, &z, (uint32_t)sources, 0, __ATOMIC_RELAXED,
-                                          __ATOMIC_RELAXED);
+        (void)MMENRICH_ATOMIC_CAS(&slot->src_floor, &z, (uint32_t)sources, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
     }
     return 0;
 }
@@ -231,12 +232,12 @@ void prev_live_set_key(prev_live_t *live, uint64_t k0, uint64_t k1) {
     memset(prev_live_slots(live), 0, (size_t)PREV_LIVE_SLOTS * sizeof(prev_live_slot_t));
     live->sip_key[0] = k0;
     live->sip_key[1] = k1;
-    __atomic_store_n(&live->seeded, 0u, __ATOMIC_RELEASE);
+    MMENRICH_ATOMIC_STORE(&live->seeded, 0u, __ATOMIC_RELEASE);
 }
 
 void prev_live_set_window_start(prev_live_t *live, uint32_t start) {
     if (live == NULL) return;
-    __atomic_store_n(&live->window_start, start, __ATOMIC_RELAXED);
+    MMENRICH_ATOMIC_STORE(&live->window_start, start, __ATOMIC_RELAXED);
 }
 
 /* A fresh header under key, or under a random key when key is NULL.
@@ -440,15 +441,15 @@ int prev_live_seed(prev_live_t *live, const char *prev_path) {
     int fd;
 
     if (live == NULL || prev_path == NULL || prev_path[0] == '\0') return -1;
-    if (__atomic_load_n(&live->seeded, __ATOMIC_ACQUIRE) != 0) return 0;
+    if (MMENRICH_ATOMIC_LOAD(&live->seeded, __ATOMIC_ACQUIRE) != 0) return 0;
     fd = open(prev_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
-        __atomic_store_n(&live->seeded, 1u, __ATOMIC_RELEASE);
+        MMENRICH_ATOMIC_STORE(&live->seeded, 1u, __ATOMIC_RELEASE);
         return 0;
     }
     if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(prev_header_t)) {
         close(fd);
-        __atomic_store_n(&live->seeded, 1u, __ATOMIC_RELEASE);
+        MMENRICH_ATOMIC_STORE(&live->seeded, 1u, __ATOMIC_RELEASE);
         return 0;
     }
     base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -464,7 +465,7 @@ int prev_live_seed(prev_live_t *live, const char *prev_path) {
         }
     }
     munmap(base, (size_t)st.st_size);
-    __atomic_store_n(&live->seeded, 1u, __ATOMIC_RELEASE);
+    MMENRICH_ATOMIC_STORE(&live->seeded, 1u, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -491,12 +492,12 @@ static int prev_image_one_edge(const char *path) {
 
 int prev_live_seed_own(prev_live_t *live, const char *local_path, const char *merged_path) {
     if (live == NULL) return -1;
-    if (__atomic_load_n(&live->seeded, __ATOMIC_ACQUIRE) != 0) return 0;
+    if (MMENRICH_ATOMIC_LOAD(&live->seeded, __ATOMIC_ACQUIRE) != 0) return 0;
     if (prev_image_one_edge(local_path)) return prev_live_seed(live, local_path);
     if (prev_image_one_edge(merged_path)) return prev_live_seed(live, merged_path);
     /* Missing, or already a merged image. Mark seeded so the next
      * publish is not imported back into the counters. */
-    __atomic_store_n(&live->seeded, 1u, __ATOMIC_RELEASE);
+    MMENRICH_ATOMIC_STORE(&live->seeded, 1u, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -512,37 +513,37 @@ static uint16_t prev_sources(const prev_live_slot_t *slot) {
     int i;
 
     for (i = 0; i < (int)PREV_LIVE_SRCS; i++) {
-        if (__atomic_load_n(&slot->src_hash[i], __ATOMIC_RELAXED) != 0) n++;
+        if (MMENRICH_ATOMIC_LOAD(&slot->src_hash[i], __ATOMIC_RELAXED) != 0) n++;
     }
-    floor = __atomic_load_n(&slot->src_floor, __ATOMIC_RELAXED);
+    floor = MMENRICH_ATOMIC_LOAD(&slot->src_floor, __ATOMIC_RELAXED);
     if (floor > n) n = floor;
     if (n > 65535u) n = 65535u;
     return (uint16_t)n;
 }
 
 static void prev_live_rotate(prev_live_t *live, uint32_t now) {
-    uint32_t start = __atomic_load_n(&live->window_start, __ATOMIC_RELAXED);
+    uint32_t start = MMENRICH_ATOMIC_LOAD(&live->window_start, __ATOMIC_RELAXED);
     uint32_t window = live->window_sec == 0 ? PREV_WINDOW_SEC : live->window_sec;
     prev_live_slot_t *slots;
     uint32_t i;
 
     if (now < start || now - start < window) return;
-    __atomic_store_n(&live->window_start, now, __ATOMIC_RELAXED);
+    MMENRICH_ATOMIC_STORE(&live->window_start, now, __ATOMIC_RELAXED);
     slots = prev_live_slots(live);
     for (i = 0; i < PREV_LIVE_SLOTS; i++) {
         prev_live_slot_t *slot = &slots[i];
         uint32_t cur;
         int s;
-        if (__atomic_load_n(&slot->key, __ATOMIC_RELAXED) == 0) continue;
-        cur = __atomic_exchange_n(&slot->count_cur, 0, __ATOMIC_RELAXED);
-        __atomic_store_n(&slot->count_prev, cur, __ATOMIC_RELAXED);
-        __atomic_store_n(&slot->edge_floor, 0u, __ATOMIC_RELAXED);
-        __atomic_store_n(&slot->src_floor, 0u, __ATOMIC_RELAXED);
+        if (MMENRICH_ATOMIC_LOAD(&slot->key, __ATOMIC_RELAXED) == 0) continue;
+        cur = MMENRICH_ATOMIC_EXCHANGE(&slot->count_cur, 0, __ATOMIC_RELAXED);
+        MMENRICH_ATOMIC_STORE(&slot->count_prev, cur, __ATOMIC_RELAXED);
+        MMENRICH_ATOMIC_STORE(&slot->edge_floor, 0u, __ATOMIC_RELAXED);
+        MMENRICH_ATOMIC_STORE(&slot->src_floor, 0u, __ATOMIC_RELAXED);
         for (s = 0; s < (int)PREV_LIVE_SRCS; s++) {
-            uint32_t sec = __atomic_load_n(&slot->src_sec[s], __ATOMIC_RELAXED);
+            uint32_t sec = MMENRICH_ATOMIC_LOAD(&slot->src_sec[s], __ATOMIC_RELAXED);
             if (sec != 0 && now > sec && now - sec > 2u * window) {
-                __atomic_store_n(&slot->src_hash[s], 0u, __ATOMIC_RELAXED);
-                __atomic_store_n(&slot->src_sec[s], 0u, __ATOMIC_RELAXED);
+                MMENRICH_ATOMIC_STORE(&slot->src_hash[s], 0u, __ATOMIC_RELAXED);
+                MMENRICH_ATOMIC_STORE(&slot->src_sec[s], 0u, __ATOMIC_RELAXED);
             }
         }
     }
@@ -762,15 +763,15 @@ int prev_live_publish(prev_live_t *live, const char *prev_path, uint32_t now_sec
     slots = prev_live_slots(live);
     for (i = 0; i < PREV_LIVE_SLOTS; i++) {
         prev_live_slot_t *slot = &slots[i];
-        uint64_t key = __atomic_load_n(&slot->key, __ATOMIC_ACQUIRE);
+        uint64_t key = MMENRICH_ATOMIC_LOAD(&slot->key, __ATOMIC_ACQUIRE);
         uint32_t cur, prev, sum;
         uint32_t edges;
         if (key == 0) continue;
-        cur = __atomic_load_n(&slot->count_cur, __ATOMIC_RELAXED);
-        prev = __atomic_load_n(&slot->count_prev, __ATOMIC_RELAXED);
+        cur = MMENRICH_ATOMIC_LOAD(&slot->count_cur, __ATOMIC_RELAXED);
+        prev = MMENRICH_ATOMIC_LOAD(&slot->count_prev, __ATOMIC_RELAXED);
         sum = prev_sum(cur, prev);
         if (sum == 0) continue;
-        edges = __atomic_load_n(&slot->edge_floor, __ATOMIC_RELAXED);
+        edges = MMENRICH_ATOMIC_LOAD(&slot->edge_floor, __ATOMIC_RELAXED);
         if (edges == 0) edges = 1;
         if (edges > 65535u) edges = 65535u;
         items[n].key = key;

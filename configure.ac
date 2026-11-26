@@ -1884,6 +1884,9 @@ AC_ARG_ENABLE(mmenrich,
 )
 
 if test "x$enable_mmenrich" = "xyes"; then
+    if test "x$ap_cv_atomic_builtins" != "xyes"; then
+            AC_MSG_ERROR([mmenrich requires compiler atomic builtins (not found, or turned off by --disable-atomic-operations)])
+    fi
     PKG_CHECK_MODULES([LIBENRICH], [enrich], [],
             [AC_MSG_ERROR([mmenrich requires libenrich (pkg-config enrich); install libenrich])])
 
@@ -1974,6 +1977,9 @@ AC_ARG_ENABLE(mmsigma,
         [enable_mmsigma=no]
 )
 if test "x$enable_mmsigma" = "xyes"; then
+        if test "x$ap_cv_atomic_builtins" != "xyes"; then
+                AC_MSG_ERROR([mmsigma requires compiler atomic builtins (not found, or turned off by --disable-atomic-operations)])
+        fi
         PKG_CHECK_MODULES([LIBSIGMA], [sigma >= 4.2.0], [],
                 [AC_MSG_ERROR([mmsigma requires libsigma 4.2.0 or later (pkg-config sigma)])])
         PKG_CHECK_MODULES([LIBENRICH], [enrich], [],

@@ -88,6 +88,7 @@
 #include <sigma/corr_format.h> /* rules.corr.json loader (the only json-dep part) */
 #include <sigma/contrib_wire.h> /* $!sigma_contribution JSON */
 #include "mmsigma_contrib.h" /* what an emitted partial carries */
+#include "mmsigma_atomic.h"
 #include <json.h>
 #include <sigma/event_time.h> /* event-time parse for correlation windows */
 
@@ -351,7 +352,7 @@ static void free_sigmac(mmsigma_db_t* d) {
 static void db_reclaim_locked(instanceData* pData) {
     uint64_t min = UINT64_MAX;
     for (mmsigma_reader_t* r = pData->dbReaders; r != NULL; r = r->next) {
-        uint64_t ep = __atomic_load_n(&r->epoch, __ATOMIC_SEQ_CST);
+        uint64_t ep = MMSIGMA_ATOMIC_LOAD(&r->epoch, __ATOMIC_SEQ_CST);
         if (ep != 0 && ep < min) min = ep;
     }
     mmsigma_db_t** pp = &pData->dbRetired;
@@ -369,8 +370,8 @@ static void db_reclaim_locked(instanceData* pData) {
 /* Swap in d and retire the db it replaces. reloadMutex held. */
 static void db_publish_locked(instanceData* pData, mmsigma_db_t* d) {
     d->gen = ++pData->dbGen;
-    mmsigma_db_t* old = __atomic_exchange_n(&pData->dbCur, d, __ATOMIC_SEQ_CST);
-    uint64_t tag = __atomic_add_fetch(&pData->dbGp, 1, __ATOMIC_SEQ_CST);
+    mmsigma_db_t* old = MMSIGMA_ATOMIC_EXCHANGE(&pData->dbCur, d, __ATOMIC_SEQ_CST);
+    uint64_t tag = MMSIGMA_ATOMIC_ADD_FETCH(&pData->dbGp, 1, __ATOMIC_SEQ_CST);
     if (old != NULL) {
         old->retire_tag = tag;
         old->next = pData->dbRetired;
@@ -383,13 +384,13 @@ static void db_publish_locked(instanceData* pData, mmsigma_db_t* d) {
  * scans the epochs, so either it sees this epoch or this load sees the new
  * db. */
 static const mmsigma_db_t* db_enter(instanceData* pData, mmsigma_reader_t* r) {
-    __atomic_store_n(&r->epoch, __atomic_load_n(&pData->dbGp, __ATOMIC_ACQUIRE), __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return __atomic_load_n(&pData->dbCur, __ATOMIC_ACQUIRE);
+    MMSIGMA_ATOMIC_STORE(&r->epoch, MMSIGMA_ATOMIC_LOAD(&pData->dbGp, __ATOMIC_ACQUIRE), __ATOMIC_RELAXED);
+    MMSIGMA_ATOMIC_FENCE(__ATOMIC_SEQ_CST);
+    return MMSIGMA_ATOMIC_LOAD(&pData->dbCur, __ATOMIC_ACQUIRE);
 }
 
 static void db_leave(mmsigma_reader_t* r) {
-    __atomic_store_n(&r->epoch, 0, __ATOMIC_RELEASE);
+    MMSIGMA_ATOMIC_STORE(&r->epoch, 0, __ATOMIC_RELEASE);
 }
 
 /* Load the artifact and publish it. reloadMutex held. *sb is the stat taken
