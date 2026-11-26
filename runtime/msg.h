@@ -125,6 +125,10 @@ struct msg {
         void *turbo_result;
         void (*turbo_result_free)(void *);
         void (*turbo_result_to_json)(void *, struct json_object **);
+        /* Looks up one $! path ("!a!b") in the snapshot. 0: a string in
+         * val/vlen. 2: an integer, its decimal text in val/vlen, valid until
+         * the next call on the thread. -1: the snapshot holds nothing at the
+         * path. 1: anything else; read the tree built from the snapshot. */
         int (*turbo_result_get_str)(void *, const uchar *, int, const uchar **, rs_size_t *);
         /* Shared-ownership refcount for turbo_result across MsgDup() copies.
          * NULL while a single message owns the snapshot (the common case:
@@ -137,6 +141,18 @@ struct msg {
          * keeps the turbo callbacks; a snapshot attached later is merged
          * into the tree on the next access. */
         sbool turbo_json_ready;
+        /* $! paths ("!source!ip") written or unset since the snapshot was
+         * attached, as case-folded 32-bit hashes in turbo_written[0, n), with
+         * turbo_written_mask as a one-bit-per-hash filter. Allocated on the
+         * first such write. turbo_written_all replaces the set when a root
+         * write or a full set leaves it incomplete. msgGetJSONPropStr() reads
+         * a field from pMsg->json when the field or one of its parents is in
+         * the set, and from the snapshot otherwise. Under mut, cleared on
+         * release. */
+        uint32_t *turbo_written;
+        uint64_t turbo_written_mask;
+        unsigned char turbo_written_n;
+        sbool turbo_written_all;
     #endif
         /* some fixed-size buffers to save malloc()/free() for frequently used fields (from the default templates) */
         uchar szRawMsg[CONF_RAWMSG_BUFSIZE];
@@ -288,6 +304,57 @@ int ATTR_NONNULL() getRawMsgLen(const smsg_t *const pMsg);
 void getRawMsg(const smsg_t *pM, uchar **pBuf, int *piLen);
 void ATTR_NONNULL() MsgTruncateToMaxSize(smsg_t *const pThis);
 rsRetVal msgAddJSON(smsg_t *pM, uchar *name, struct json_object *json, int force_reset, int sharedReference);
+/**
+ * @brief Copy the text of one scalar $! field.
+ *
+ * Returns the text a template renders for @p name (a string, or a number or
+ * boolean in its JSON text), read from the turbo snapshot when no $! write
+ * since the snapshot was attached touched that path, and from pMsg->json
+ * otherwise. Takes @p pMsg's mutex itself; the
+ * mutex is not recursive, so a caller already holding it must not call this.
+ *
+ * @param name  NUL-terminated $! path such as "!source!ip"
+ * @param nameLen  strlen(name)
+ * @param buf  receives the value, NUL-terminated
+ * @param bufLen  size of buf
+ * @param valLen  receives the value length; on RS_RET_PROVIDED_BUFFER_TOO_SMALL
+ *                the length that did not fit
+ * @return RS_RET_OK; RS_RET_NOT_FOUND when the field is absent, null, an
+ *         object or an array; RS_RET_PROVIDED_BUFFER_TOO_SMALL; RS_RET_INVALID_PARAMS for a
+ *         name that is not a $! field; RS_RET_OUT_OF_MEMORY when the tree
+ *         could not be built.
+ */
+rsRetVal msgGetJSONPropStr(smsg_t *pMsg, const uchar *name, size_t nameLen, uchar *buf, size_t bufLen, size_t *valLen);
+    /* The work msgGetJSONPropStrLocked() does on a $! path that does not depend
+     * on the message, done once for a path read many times. */
+    #define MSG_JSON_KEY_HASHES 8
+typedef struct msgJSONKey {
+    uint64_t bits; /* filter bits of hash[0, n) */
+    uint32_t hash[MSG_JSON_KEY_HASHES]; /* the path and each parent of it */
+    size_t len; /* length of the path the key was built for */
+    unsigned char n; /* 0: no key (more parents than fit, or no turbo) */
+} msgJSONKey_t;
+/**
+ * @brief Prepare @p key for reads of the $! path name[0, nameLen).
+ */
+void msgJSONKeyInit(msgJSONKey_t *key, const uchar *name, size_t nameLen);
+/**
+ * @brief msgGetJSONPropStr() for a caller that holds @p pMsg's mutex.
+ *
+ * Lets a module read many fields under one MsgLock()/MsgUnlock() pair. The
+ * caller must not call anything that takes the mutex (msgAddJSON(), property
+ * getters) until it unlocks. @p key is NULL, or was built by msgJSONKeyInit()
+ * for this same name; a key built for a name of another length is ignored.
+ */
+rsRetVal msgGetJSONPropStrLocked(smsg_t *pMsg,
+                                 const uchar *name,
+                                 size_t nameLen,
+                                 const msgJSONKey_t *key,
+                                 uchar *buf,
+                                 size_t bufLen,
+                                 size_t *valLen);
+    /* Lets a module check at build time that the core has msgGetJSONPropStr(). */
+    #define RS_HAVE_MSG_GET_JSON_PROP_STR 1
 rsRetVal msgAddMetadata(smsg_t *msg, uchar *metaname, uchar *metaval);
 rsRetVal msgAddMultiMetadata(smsg_t *msg, const uchar **metaname, const uchar **metaval, const int count);
 rsRetVal MsgGetSeverity(smsg_t *pThis, int *piSeverity);
