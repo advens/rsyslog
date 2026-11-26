@@ -124,8 +124,9 @@ STATSCOUNTER_DEF(ctrHitsTruncated, mutCtrHitsTruncated)
 STATSCOUNTER_DEF(ctrCorrTsFallback, mutCtrCorrTsFallback)
 /* corr.timestamp.ahead / .behind: an event or contribution time more than
  * corrmaxahead after, or corrmaxbehind before, the receive time, clamped to
- * that bound. The engine sweeps expired groups on event time, so an unbounded
- * future time would drop every group. */
+ * that bound. With event-time ordering, a future time raises its group's
+ * watermark, so corrmaxahead bounds how long one event can hold later ones
+ * out as late. */
 STATSCOUNTER_DEF(ctrCorrTsAhead, mutCtrCorrTsAhead)
 STATSCOUNTER_DEF(ctrCorrTsBehind, mutCtrCorrTsBehind)
 /* corr.timestamp.syslog: no parseable field, used rsyslog's msg tTIMESTAMP
@@ -452,6 +453,31 @@ static corr_caps_t corr_caps_from(const instanceData* pData) {
     return caps;
 }
 
+/* Receive time of the message this worker is evaluating, read by the engine
+ * clock. Set around each corr_on_event_apply / corr_on_contribution call and
+ * cleared after it. */
+static __thread double mmsigma_clock_recv = 0.0;
+
+/* Engine clock: the receive time rsyslog stamped on the current message, so
+ * the sender cannot move it and a queued backlog keeps its own times. Wall
+ * clock if a call path did not set it. */
+static double mmsigma_corr_clock(void* ctx) {
+    (void)ctx;
+    if (mmsigma_clock_recv > 0.0) return mmsigma_clock_recv;
+    struct timespec tsp;
+    clock_gettime(CLOCK_REALTIME, &tsp);
+    return (double)tsp.tv_sec + (double)tsp.tv_nsec / 1e9;
+}
+
+/* Event times come from outside rsyslog when they are parsed from the message
+ * or carried by a peer's contribution. Then the engine sweeps on the receive
+ * clock minus corrmaxbehind, so neither a sender nor a source that runs late
+ * moves the sweep. Otherwise event time is the receive time and the engine
+ * keeps sweeping on it, which keeps groups no longer than their window. */
+static int corr_wants_clock(const instanceData* pData) {
+    return pData->useLogTimestamp || pData->contribInput != NULL || pData->corrMode == 1;
+}
+
 /* Build a fresh (engine, artifact) pair from corrFile.  On success eOut/aOut
  * receive the new pair (the engine references the artifact's storage) and, when
  * lsOut is non-NULL, the loader's boundary tallies for this artifact. */
@@ -464,6 +490,12 @@ static int build_corr_engine(instanceData* pData,
     if (art == NULL) return -1;
     corr_engine_t* eng = corr_engine_new(view.rules, view.n, corr_caps_from(pData));
     if (eng == NULL) {
+        corr_artifact_free(art);
+        return -1;
+    }
+    if (corr_wants_clock(pData) && corr_engine_set_clock(eng, mmsigma_corr_clock, NULL, (double)pData->corrMaxAhead,
+                                                         (double)pData->corrMaxBehind) != 0) {
+        corr_engine_free(eng);
         corr_artifact_free(art);
         return -1;
     }
@@ -669,8 +701,9 @@ static double mmsigma_recv_time(const smsg_t* pMsg) {
 }
 
 /* Clamp a sender-supplied time to the accepted skew around the receive time.
- * The engine sweeps expired groups on event time, so ahead bounds how far one
- * event can move the sweep, and its default is small. */
+ * The engine clock applies the same bounds; this copy keeps the live
+ * corr.timestamp counters. ahead stays small: with event-time ordering it
+ * bounds how far one event can raise its group's watermark. */
 static double mmsigma_bound_time(const instanceData* pData, double ts, double recv) {
     if (!isfinite(ts)) {
         STATSCOUNTER_INC(ctrCorrTsFallback, mutCtrCorrTsFallback);
@@ -707,9 +740,12 @@ static void mmsigma_ingest_one(
         return;
     }
     STATSCOUNTER_INC(ctrCorrContribIngest, mutCtrCorrContribIngest);
-    c.ts = mmsigma_bound_time(pData, c.ts, mmsigma_recv_time(pMsg));
+    const double recv = mmsigma_recv_time(pMsg);
+    c.ts = mmsigma_bound_time(pData, c.ts, recv);
+    mmsigma_clock_recv = recv;
     nf = corr_on_contribution(eng, &c, NULL, NULL, fires, MMSIGMA_MAX_FIRES, pWrkrData->corrScratch,
                               sizeof(pWrkrData->corrScratch) / sizeof(pWrkrData->corrScratch[0]));
+    mmsigma_clock_recv = 0.0;
     if (nf <= 0) return;
     {
         int fcapped = (nf < MMSIGMA_MAX_FIRES) ? nf : MMSIGMA_MAX_FIRES;
@@ -1634,10 +1670,12 @@ BEGINdoAction_NoStrings
             }
 
             corr_fire_t fires[MMSIGMA_MAX_FIRES];
+            mmsigma_clock_recv = recv;
             int nf = corr_on_event_apply(corrEng, rids, (size_t)n_rids, mmsigma_corr_field_fn, (void*)&fctx, ts, fires,
                                          MMSIGMA_MAX_FIRES, pWrkrData->corrScratch,
                                          sizeof(pWrkrData->corrScratch) / sizeof(pWrkrData->corrScratch[0]),
                                          mmsigma_apply_owned, (void*)pData);
+            mmsigma_clock_recv = 0.0;
             mmsigma_emit_contribs(pData, corrEng, (void*)&fctx, rids, (size_t)n_rids, ts, pMsg);
             if (nf > 0) {
                 int fcapped = (nf < MMSIGMA_MAX_FIRES) ? nf : MMSIGMA_MAX_FIRES;
