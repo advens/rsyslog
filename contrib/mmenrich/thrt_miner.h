@@ -40,6 +40,7 @@
  * classification, shared with other modules. */
 #include "thrt_logic.h"
 #include "thrt_payload.h"
+#include "mmenrich_atomic.h"
 
 /* --- SIMD Detection ---
  * NEON is part of the mandatory AArch64 base ISA (unlike x86's SSE4.2/AVX2
@@ -517,11 +518,11 @@ static inline void analyze_token_neon(const char* start, size_t len, token_stats
  * entirely: mine_iocs_simd() calls this once per message, not per token. */
 static int thrt_cpu_has_avx2(void) {
     static int cached = -1;
-    int c = __atomic_load_n(&cached, __ATOMIC_RELAXED);
+    int c = MMENRICH_ATOMIC_LOAD(&cached, __ATOMIC_RELAXED);
     if (c < 0) {
         __builtin_cpu_init();
         c = __builtin_cpu_supports("avx2") ? 1 : 0;
-        __atomic_store_n(&cached, c, __ATOMIC_RELAXED);
+        MMENRICH_ATOMIC_STORE(&cached, c, __ATOMIC_RELAXED);
     }
     return c;
 }

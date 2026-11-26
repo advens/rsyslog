@@ -17,6 +17,7 @@ mmenrich_la_SOURCES = mmenrich.c \
                       thrt_file_cache.c \
                       thrt_file_cache.h \
                       thrt_miner.h \
+                      mmenrich_atomic.h \
                       enrich_json.h \
                       thrt_payload.h \
                       thrt_ua.h \

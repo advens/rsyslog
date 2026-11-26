@@ -13,7 +13,7 @@
 
 pkglib_LTLIBRARIES = mmsigma.la
 
-mmsigma_la_SOURCES = mmsigma.c mmsigma_contrib.h
+mmsigma_la_SOURCES = mmsigma.c mmsigma_contrib.h mmsigma_atomic.h
 # -I../ecs_derive: shared ECS derived-field layer. The prevalence table is
 # read through libenrich (pkg-config enrich).
 mmsigma_la_CPPFLAGS = $(RSRT_CFLAGS) $(PTHREADS_CFLAGS) $(JSON_C_CFLAGS) \

@@ -55,6 +55,7 @@
 #include "dirty.h"
 #include "statsobj.h"
 #include "unicode-helper.h" /* UCHAR_CONSTANT for impstats counter names */
+#include "mmenrich_atomic.h"
 
 /* libenrich: the .thrt, overlay and .prev lookups, their policy and reload */
 #include "enrich.h"
@@ -275,7 +276,7 @@ static struct json_object* geoip_cache_read(geoip_cache_t* c, const char* ip) {
              * the same value 1; relaxed is enough since the evictor only
              * ever reads `ref` while holding the exclusive WR-lock (that
              * lock is the synchronization point, not this store's order). */
-            __atomic_store_n(&e->ref, 1, __ATOMIC_RELAXED);
+            MMENRICH_ATOMIC_STORE(&e->ref, 1, __ATOMIC_RELAXED);
             struct json_object* copy = jsonDeepCopy(e->jGeo);
             pthread_rwlock_unlock(&c->lock);
             return copy;
@@ -1098,7 +1099,7 @@ static rsRetVal reloadGeoipDatabase(instanceData* pData) {
 
     pthread_mutex_lock(&pData->reloadMutex); /* Reuse same mutex */
 
-    geoip_snapshot_t* oldSnap = __atomic_load_n(&pData->geoipDb, __ATOMIC_ACQUIRE);
+    geoip_snapshot_t* oldSnap = MMENRICH_ATOMIC_LOAD(&pData->geoipDb, __ATOMIC_ACQUIRE);
     thrt_caches_ensure();
     geoip_snapshot_t* newSnap = thrt_file_cache_refresh(g_geoipCache, (char*)pData->geoipDbPath, oldSnap);
     if (newSnap == oldSnap) {
@@ -1113,8 +1114,8 @@ static rsRetVal reloadGeoipDatabase(instanceData* pData) {
 
     LogMsg(0, RS_RET_OK, LOG_INFO, "mmenrich/geoip: reloading %s", pData->geoipDbPath);
 
-    __atomic_store_n(&pData->geoipDb, newSnap, __ATOMIC_RELEASE);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    MMENRICH_ATOMIC_STORE(&pData->geoipDb, newSnap, __ATOMIC_RELEASE);
+    MMENRICH_ATOMIC_FENCE(__ATOMIC_SEQ_CST);
     geoip_cache_flush(pData->geoipCache);
 
     pthread_mutex_unlock(&pData->reloadMutex);
@@ -1133,7 +1134,7 @@ static rsRetVal reloadGeoipAsnDatabase(instanceData* pData) {
 
     pthread_mutex_lock(&pData->reloadMutex);
 
-    geoip_snapshot_t* oldSnap = __atomic_load_n(&pData->geoipAsnDb, __ATOMIC_ACQUIRE);
+    geoip_snapshot_t* oldSnap = MMENRICH_ATOMIC_LOAD(&pData->geoipAsnDb, __ATOMIC_ACQUIRE);
     thrt_caches_ensure();
     geoip_snapshot_t* newSnap = thrt_file_cache_refresh(g_geoipAsnCache, (char*)pData->geoipAsnDbPath, oldSnap);
     if (newSnap == oldSnap) {
@@ -1148,8 +1149,8 @@ static rsRetVal reloadGeoipAsnDatabase(instanceData* pData) {
 
     LogMsg(0, RS_RET_OK, LOG_INFO, "mmenrich/geoip-asn: reloading %s", pData->geoipAsnDbPath);
 
-    __atomic_store_n(&pData->geoipAsnDb, newSnap, __ATOMIC_RELEASE);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    MMENRICH_ATOMIC_STORE(&pData->geoipAsnDb, newSnap, __ATOMIC_RELEASE);
+    MMENRICH_ATOMIC_FENCE(__ATOMIC_SEQ_CST);
 
     geoip_cache_flush(pData->geoipAsnCache);
 
@@ -1686,10 +1687,10 @@ static rsRetVal process_lookup_mode_v4_mappings(instanceData* pData,
     geoip_snapshot_t* geoSnap = NULL;
     geoip_snapshot_t* asnSnap = NULL;
     if (pData->geoipEnabled) {
-        geoSnap = __atomic_load_n(&pData->geoipDb, __ATOMIC_ACQUIRE);
+        geoSnap = MMENRICH_ATOMIC_LOAD(&pData->geoipDb, __ATOMIC_ACQUIRE);
     }
     if (pData->geoipAsnEnabled) {
-        asnSnap = __atomic_load_n(&pData->geoipAsnDb, __ATOMIC_ACQUIRE);
+        asnSnap = MMENRICH_ATOMIC_LOAD(&pData->geoipAsnDb, __ATOMIC_ACQUIRE);
     }
 #endif
 
@@ -1841,17 +1842,17 @@ static prev_live_t* mmenrich_prev_live(void) {
     prev_live_t* live;
     uint32_t back;
     if (g_prevLivePath == NULL) return NULL;
-    live = __atomic_load_n(&g_prevLive, __ATOMIC_ACQUIRE);
+    live = MMENRICH_ATOMIC_LOAD(&g_prevLive, __ATOMIC_ACQUIRE);
     if (live != NULL) return live;
-    back = __atomic_load_n(&g_prevLiveBackoff, __ATOMIC_RELAXED);
+    back = MMENRICH_ATOMIC_LOAD(&g_prevLiveBackoff, __ATOMIC_RELAXED);
     if (back > 0) {
-        (void)__atomic_compare_exchange_n(&g_prevLiveBackoff, &back, back - 1u, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+        (void)MMENRICH_ATOMIC_CAS(&g_prevLiveBackoff, &back, back - 1u, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
         return NULL;
     }
     pthread_mutex_lock(&g_prevLiveMu);
     if (g_prevLive == NULL) {
         g_prevLive = prev_live_open_keyed(g_prevLivePath, g_prevKeySet ? g_prevKey : NULL);
-        if (g_prevLive == NULL) __atomic_store_n(&g_prevLiveBackoff, 10000u, __ATOMIC_RELAXED);
+        if (g_prevLive == NULL) MMENRICH_ATOMIC_STORE(&g_prevLiveBackoff, 10000u, __ATOMIC_RELAXED);
     }
     live = g_prevLive;
     pthread_mutex_unlock(&g_prevLiveMu);
@@ -2029,11 +2030,11 @@ static void mmenrich_periodic_reload(instanceData* pData) {
     char err[512];
     int rc;
     if (pData->enrich == NULL) return;
-    if (!__atomic_compare_exchange_n(&pData->enrichReloading, &idle, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    if (!MMENRICH_ATOMIC_CAS(&pData->enrichReloading, &idle, 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
     err[0] = '\0';
     rc = enrich_reload(pData->enrich, &changed, err, sizeof err);
     mmenrich_log_reload(pData, rc, changed, err);
-    __atomic_store_n(&pData->enrichReloading, 0u, __ATOMIC_RELEASE);
+    MMENRICH_ATOMIC_STORE(&pData->enrichReloading, 0u, __ATOMIC_RELEASE);
 }
 
 BEGINdoAction_NoStrings
@@ -2111,7 +2112,7 @@ BEGINdoAction_NoStrings
             const char* ua = NULL;
             size_t ualen = 0;
             ua_class_t uacl;
-            ua_table_t* uat = __atomic_load_n(&pData->uaTable, __ATOMIC_ACQUIRE);
+            ua_table_t* uat = MMENRICH_ATOMIC_LOAD(&pData->uaTable, __ATOMIC_ACQUIRE);
             if (ln_fast_result_get_string(r, "user_agent.original", &ua, &ualen) == 0 &&
                 ua_classify(uat, ua, ualen, &uacl) == 0 && uacl.kind != UA_KIND_NONE) {
                 if (uacl.cls) {
@@ -2129,7 +2130,7 @@ BEGINdoAction_NoStrings
             const char* host = NULL;
             size_t hostlen = 0;
             tld_class_t tldcl;
-            tld_table_t* tldt = __atomic_load_n(&pData->tldTable, __ATOMIC_ACQUIRE);
+            tld_table_t* tldt = MMENRICH_ATOMIC_LOAD(&pData->tldTable, __ATOMIC_ACQUIRE);
             if (ln_fast_result_get_string(r, "url.domain", &host, &hostlen) == 0 &&
                 tld_classify(tldt, host, hostlen, &tldcl) == 0 && tldcl.kind != TLD_KIND_NONE) {
                 if (tldcl.cls) {
@@ -2247,7 +2248,7 @@ BEGINdoHUP
         if (pData->uaPath) {
             ua_table_t* old = pData->uaTable;
             ua_table_t* neu = thrt_file_cache_refresh(g_uaCache, (const char*)pData->uaPath, old);
-            if (neu != old) __atomic_store_n(&pData->uaTable, neu, __ATOMIC_RELEASE);
+            if (neu != old) MMENRICH_ATOMIC_STORE(&pData->uaTable, neu, __ATOMIC_RELEASE);
             if (neu != old && neu) {
                 LogMsg(0, RS_RET_OK, LOG_INFO,
                        "mmenrich/ua: reloaded %u exact, %u contains, %u prefixes, %u suffixes from %s", neu->n,
@@ -2257,7 +2258,7 @@ BEGINdoHUP
         if (pData->tldPath) {
             tld_table_t* old = pData->tldTable;
             tld_table_t* neu = thrt_file_cache_refresh(g_tldCache, (const char*)pData->tldPath, old);
-            if (neu != old) __atomic_store_n(&pData->tldTable, neu, __ATOMIC_RELEASE);
+            if (neu != old) MMENRICH_ATOMIC_STORE(&pData->tldTable, neu, __ATOMIC_RELEASE);
             if (neu != old && neu) {
                 LogMsg(0, RS_RET_OK, LOG_INFO, "mmenrich/tld: reloaded %u entries from %s", neu->n, pData->tldPath);
             }
