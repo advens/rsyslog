@@ -5,10 +5,11 @@
  * rules (a `.sigmac` artifact) against each message's parsed fields and inject
  * the verdict under `$!sigma`.
  *
- * Input fields come from the liblognorm TurboVM result attached to the message
- * (pMsg->turbo_result, flat dotted keys, e.g. "source.ip"), so mmnormalize must
- * run with turbo="on" earlier in the pipeline. Selection match, correlation,
- * contrib JSON, and event-time live in libsigma. This file is the rsyslog glue.
+ * Input fields are read by their dotted names ("source.ip") through
+ * turbo_field.h: the liblognorm TurboVM snapshot mmnormalize (turbo="on")
+ * attached to the message, or $! for a path written since the parse.
+ * Selection match, correlation, contrib JSON, and event-time live in
+ * libsigma. This file is the rsyslog glue.
  *
  * The `.sigmac` and `rules.corr.json` files are written by
  * pySigma-backend-libsigma. A deployment may filter the rule set first (the
@@ -73,12 +74,10 @@
 #include "statsobj.h"
 #include "unicode-helper.h"
 
-/* Parsed fields prefer the liblognorm TurboVM snapshot (pMsg->turbo_result)
- * when the module is built with HAVE_LOGNORM_TURBO. Without it, matching falls
- * back to the $! tree for every event (same path as a missing snapshot). */
-#ifdef HAVE_LOGNORM_TURBO
-    #include <lognorm-turbo.h> /* ln_fast_result_* + snapshot accessors */
-#endif
+/* Parsed fields come through turbo_field.h: the TurboVM snapshot when the core
+ * is built with HAVE_LOGNORM_TURBO and no $! write touched the path, the $!
+ * tree otherwise (same answer a template gets). */
+#include "turbo_field.h"
 
 #include <sigma/sigma_match.h>
 #include <sigma/sigma_format.h>
@@ -100,7 +99,7 @@ DEF_OMOD_STATIC_DATA
 DEFobjCurrIf(statsobj)
 
     /* Module-global impstats.  turbo.missing counts events evaluated WITHOUT the
-     * zero-copy turbo arena (fallback to the $! tree), a steadily rising counter
+     * turbo snapshot (every field from the $! tree), a steadily rising counter
      * means an upstream path is losing the parse snapshot and matching runs
      * degraded instead of silently not at all.  matched.events counts events with
      * at least one rule hit. */
@@ -285,6 +284,7 @@ typedef struct wrkrInstanceData {
      * Per worker so the per-event field context stays small to initialise. */
     char corrVal[MMSIGMA_CORR_VAL_ARENA];
     enrich_reader_t* prevReader; /* this worker's view of pData->prev */
+    tf_store_t tf; /* field values read for the current message */
 } wrkrInstanceData_t;
 
 static const char* mmsigma_corr_field_fn(void* ctx, const char* name);
@@ -840,26 +840,17 @@ static void reloadPrevalenceDb(instanceData* pData) {
     if (rc != ENRICH_OK && rc != ENRICH_ENOENT) DBGPRINTF("mmsigma/prev: reload kept the current table: %s\n", err);
 }
 
-/* ---- field resolution: matcher callback over the turbo result ----------
- * Truly zero-copy: the .sigmac contract guarantees every field NAME in the
- * strpool is NUL-terminated (validated at load: a non-terminated artifact is
- * rejected).  The matcher therefore hands us `db->strpool + off`, already a
- * valid C string, so we pass it straight to ln_fast_result_get_string(), no
- * bounce buffer, no copy, no length guard.  `name_len` is unused here. */
-/* Per-event field-resolution context: the zero-copy turbo arena
- * result PLUS the $! enrichment root.  geoip, cti and tls.ja4 fields are
- * produced by mmenrich into $! (NOT the turbo arena), so a rule referencing them
- * resolves on arena-miss against `enrich`.  `enrich` is the BORROWED pMsg->json
- * root (no deep copy): mmenrich's msgAddJSON already populated it, and the msg
- * is owned by this worker for the whole doAction, so the borrowed pointer stays
- * valid across the match.  NULL when the message carries no $! tree yet. */
+/* ---- field resolution: matcher callback over the parsed fields ----------
+ * The .sigmac contract guarantees every field NAME in the strpool is
+ * NUL-terminated (validated at load: a non-terminated artifact is rejected).
+ * The matcher therefore hands us `db->strpool + off`, already a valid C
+ * string, which goes straight to tf_get().  `name_len` is unused there. */
+/* Per-event field-resolution context. tf reads a field the way a template
+ * reads $!: from the turbo snapshot, or from the $! tree for a path written
+ * since the parse, including what mmenrich emitted there (geoip, cti,
+ * tls.ja4). Each value is a terminated copy, valid for the whole event. */
 typedef struct {
-#ifdef HAVE_LOGNORM_TURBO
-    const ln_fast_result_t* r; /* turbo arena (parsed fields, zero-copy) */
-#else
-    const void* r; /* unused; $! fallback only */
-#endif
-    struct json_object* enrich; /* borrowed $! root, or NULL */
+    tf_ctx_t tf;
     const char* rawmsg; /* pristine raw event line, event.original fallback; NULL if absent */
     size_t rawmsg_len;
     /* Bump arena for COMPUTED field values (ecs_derive numerics +
@@ -868,7 +859,8 @@ typedef struct {
      * earlier field's still-cached value (e.g. digit_ratio clobbering entropy),
      * silently failing any rule that reads the earlier field from the memo.
      * Each computed resolution instead gets its OWN slot here; reset per event.
-     * SLICE derives (url.path) borrow the arena/$! and consume no slot. */
+     * SLICE derives (url.path) borrow the source value's copy and consume no
+     * slot. */
     char derive_arena[ECS_DERIVE_BUFSZ * MMSIGMA_DERIVE_SLOTS];
     size_t derive_off; /* next free byte in derive_arena */
     /* prevalence table for the event (borrowed from the loaded snapshot;
@@ -887,21 +879,6 @@ typedef struct {
     } corr_memo[MMSIGMA_CORR_VAL_MEMO];
 } mmsigma_fieldctx_t;
 
-#ifdef HAVE_LOGNORM_TURBO
-static int mmsigma_turbo_get(const ln_fast_result_t* r, const char* name, const char** val, size_t* vlen) {
-    if (r == NULL) return 0;
-    return ln_fast_result_get_string(r, name, val, vlen) == 0;
-}
-#else
-static int mmsigma_turbo_get(const void* r, const char* name, const char** val, size_t* vlen) {
-    (void)r;
-    (void)name;
-    (void)val;
-    (void)vlen;
-    return 0;
-}
-#endif
-
 /* Next COMPUTED-value slot in the per-event arena; wraps to the start when a
  * full ECS_DERIVE_BUFSZ no longer fits (bounded reuse: a single event resolves
  * far fewer computed fields than MMSIGMA_DERIVE_SLOTS, so the wrap is dead code
@@ -918,55 +895,12 @@ static inline char* mmsigma_derive_slot(mmsigma_fieldctx_t* fc) {
 #define MMSIGMA_EVENT_ORIGINAL "event.original"
 #define MMSIGMA_EVENT_ORIGINAL_LEN 14
 
-static const char* mmsigma_enrich_lookup(struct json_object* root, const char* name, size_t* out_len);
-
-/* ecs_derive source-reader: adapts ln_fast_result_get_string to ecs_src_get_fn
- * (1 on hit). Lets a derived field (e.g. url.path) read its source (url.original)
- * from the zero-copy snapshot, or from the $! tree when the arena is absent. */
+/* ecs_derive source-reader for ecs_src_get_fn (1 on hit). Lets a derived
+ * field (e.g. url.path) read its source (url.original) the way any other
+ * field is read. */
 static int mmsigma_src_get(void* ctx, const char* name, const char** val, size_t* vlen) {
     const mmsigma_fieldctx_t* fc = (const mmsigma_fieldctx_t*)ctx;
-    if (mmsigma_turbo_get(fc->r, name, val, vlen)) return 1;
-    if (fc->enrich != NULL) {
-        size_t elen = 0;
-        const char* ev = mmsigma_enrich_lookup(fc->enrich, name, &elen);
-        if (ev != NULL) {
-            *val = ev;
-            *vlen = elen;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Resolve a dotted field name (e.g. "source.geo.country_name") against the
- * borrowed $! enrichment root, walking each '.'-segment as a nested-object key
- *, a couple of O(1) json_object_object_get_ex hash-gets, no per-field root
- * re-fetch.  Returns the leaf value as a C string (NUL-terminated; libfastjson
- * renders non-string leaves like ints) valid for this event, or NULL. */
-static const char* mmsigma_enrich_lookup(struct json_object* root, const char* name, size_t* out_len) {
-    if (root == NULL || name == NULL) return NULL;
-    struct json_object* cur = root;
-    const char* seg = name;
-    for (;;) {
-        const char* dot = strchr(seg, '.');
-        size_t klen = dot ? (size_t)(dot - seg) : strlen(seg);
-        if (klen == 0 || klen >= 128) return NULL;
-        char key[128];
-        memcpy(key, seg, klen);
-        key[klen] = '\0';
-        struct json_object* next = NULL;
-        if (!json_object_object_get_ex(cur, key, &next)) return NULL;
-        if (dot == NULL) { /* leaf segment */
-            if (json_object_is_type(next, json_type_object) || json_object_is_type(next, json_type_array)) return NULL;
-            const char* v = json_object_get_string(next);
-            if (v == NULL) return NULL;
-            *out_len = strlen(v);
-            return v;
-        }
-        if (!json_object_is_type(next, json_type_object)) return NULL; /* more segments but not an object */
-        cur = next;
-        seg = dot + 1;
-    }
+    return tf_get(&fc->tf, name, val, vlen) == 0;
 }
 
 static const char* mmsigma_field_fn(void* ctx, const char* name, uint32_t name_len, size_t* out_len) {
@@ -977,36 +911,11 @@ static const char* mmsigma_field_fn(void* ctx, const char* name, uint32_t name_l
     (void)name_len;
     *out_len = 0;
     if (fc == NULL) return NULL;
-    /* Zero-copy arena first; fc->r may be NULL when the message lost its turbo
-     * snapshot (duplicating queue boundary, disk-queue replay), every lookup
-     * then falls through to the derive/$! chain below, which resolves against
-     * the already-materialized $! tree with identical semantics. */
-    if (mmsigma_turbo_get(fc->r, name, &val, &vlen)) {
-        *out_len = vlen;
-        return val;
-    }
-    /* Arena miss: try an ECS derivation. E.g. a rule on
-     * url.path resolves against url.original when no rulebase emits the
-     * path field directly. Zero-copy, the derived slice points into the
-     * source value already in the arena (or the $! tree in fallback). */
-    {
-        const char* dval = NULL;
-        size_t dlen = 0;
-        char* slot = mmsigma_derive_slot(fc);
-        if (ecs_derive_lookup(name, mmsigma_src_get, (void*)fc, &dval, &dlen, slot, ECS_DERIVE_BUFSZ)) {
-            /* COMPUTED transforms write into slot (consume it so a later
-             * computed field can't overwrite this one's memoized pointer);
-             * SLICE transforms borrow the arena/$! and consume nothing. */
-            if (dval == slot) fc->derive_off += dlen + 1;
-            *out_len = dlen;
-            return dval;
-        }
-    }
-    /* Prevalence: resolve <field>_prevalence (total count) and
-     * <field>_prevalence_edges (DISTINCT edges = spread-rarity) from the .prev table.
-     * mmenrich emits the same facts into $! for the enriched output; resolving
-     * them here from the parsed arena keeps rule matching on the fast path and
-     * off any cross-module $! ordering (the same reason entropy is computed here
+    /* Prevalence first: resolve <field>_prevalence (total count) and
+     * <field>_prevalence_edges (DISTINCT edges = spread-rarity) from the .prev
+     * table. mmenrich emits the same facts into $! for the enriched output;
+     * resolving them here from this worker's table keeps rule matching off
+     * any cross-module $! ordering (the same reason entropy is computed here
      * rather than read back from $!). Skipped while the table is unwarmed
      * (count_max==0) so a cold table never scores every value as rare. */
     if (fc->prev != NULL) {
@@ -1032,11 +941,9 @@ static const char* mmsigma_field_fn(void* ctx, const char* name, uint32_t name_l
             if (blen < sizeof(base)) {
                 memcpy(base, name, blen);
                 base[blen] = '\0';
-                /* Resolve the base observable through the full chain (turbo arena
-                 * when present, else the $! tree into which parser fields are
-                 * materialized at a queue boundary) so rarity resolves on EVERY
-                 * event, not only the arena-present minority. base carries no
-                 * rarity suffix, so this never recurses into this block. */
+                /* Resolve the base observable through the full chain, so
+                 * rarity resolves on every event. base carries no rarity
+                 * suffix, so this never recurses into this block. */
                 size_t bvlen = 0;
                 const char* bv = mmsigma_field_fn(ctx, base, (uint32_t)blen, &bvlen);
                 enrich_prev_t pv;
@@ -1055,20 +962,31 @@ static const char* mmsigma_field_fn(void* ctx, const char* name, uint32_t name_l
             }
         }
     }
-    /* Still absent: try the $! enrichment root. geoip.*, cti.*,
-     * tls.ja4 are emitted by mmenrich into $!, not the arena. Parsed-field
-     * matching above stays zero-copy; only this enrichment minority pays the
-     * cached-$! lookup. */
-    if (fc->enrich != NULL) {
-        size_t elen = 0;
-        const char* ev = mmsigma_enrich_lookup(fc->enrich, name, &elen);
-        if (ev != NULL) {
-            *out_len = elen;
-            return ev;
+    /* The parsed field, or what $! holds for it: a value the configuration
+     * set after the parse (X-Forwarded-For promoted into source.ip), or a
+     * field mmenrich emitted (geoip, cti, tls.ja4, derived ECS fields). */
+    if (tf_get(&fc->tf, name, &val, &vlen) == 0) {
+        *out_len = vlen;
+        return val;
+    }
+    /* Absent: try an ECS derivation. E.g. a rule on url.path resolves
+     * against url.original when neither the rulebase nor mmenrich emitted
+     * the path field. A derived slice points into the source value's copy. */
+    {
+        const char* dval = NULL;
+        size_t dlen = 0;
+        char* slot = mmsigma_derive_slot(fc);
+        if (ecs_derive_lookup(name, mmsigma_src_get, (void*)fc, &dval, &dlen, slot, ECS_DERIVE_BUFSZ)) {
+            /* COMPUTED transforms write into slot (consume it so a later
+             * computed field can't overwrite this one's memoized pointer);
+             * SLICE transforms borrow the source copy and consume nothing. */
+            if (dval == slot) fc->derive_off += dlen + 1;
+            *out_len = dlen;
+            return dval;
         }
     }
     /* event.original fallback: fieldless keyword rules resolve here. A parser
-     * value (arena / $! above) wins; otherwise return the pristine raw line so a
+     * or $! value above wins; otherwise return the pristine raw line so a
      * keyword rule still matches the full message. The name[0]=='e' guard keeps
      * this off the hot path for every other absent field. */
     if (fc->rawmsg != NULL && name[0] == 'e' && name_len == MMSIGMA_EVENT_ORIGINAL_LEN &&
@@ -1092,15 +1010,12 @@ static const char* verdict_name(uint8_t v) {
 
 /* Correlation group-by / value field resolver. The engine's callback returns
  * a C string: libsigma calls strlen, strcmp and strtod on it and keeps the
- * pointer as group evidence until the fires are serialised. It resolves over
- * the same field context as mmsigma_field_fn: the turbo arena first, then the
- * $! tree when the arena is absent.
+ * pointer as group evidence until the fires are serialised. It reads fields
+ * through the same tf context as mmsigma_field_fn.
  *
- * liblognorm keeps a turbo value of 48 bytes or more as a pointer and length
- * into the message, with no terminator, so the value is copied, terminated,
- * into the per-event arena. A value that does not fit is treated as absent
- * (corr.value.overflow) rather than cut, which would merge distinct groups.
- * $! values are json-c strings and already terminated. */
+ * The value is copied, terminated, into the per-event correlation arena. A
+ * value that does not fit is treated as absent (corr.value.overflow) rather
+ * than cut, which would merge distinct groups. */
 static const char* mmsigma_corr_field_fn(void* ctx, const char* name) {
     mmsigma_fieldctx_t* fc = (mmsigma_fieldctx_t*)ctx;
     const char* val = NULL;
@@ -1108,7 +1023,7 @@ static const char* mmsigma_corr_field_fn(void* ctx, const char* name) {
     if (fc == NULL || name == NULL) return NULL;
     for (uint32_t i = 0; i < fc->corr_n; i++)
         if (fc->corr_memo[i].name == name || strcmp(fc->corr_memo[i].name, name) == 0) return fc->corr_memo[i].val;
-    if (mmsigma_turbo_get(fc->r, name, &val, &vlen)) {
+    if (tf_get(&fc->tf, name, &val, &vlen) == 0) {
         if (fc->corr_arena == NULL || vlen >= fc->corr_cap - fc->corr_off) {
             STATSCOUNTER_INC(ctrCorrValOverflow, mutCtrCorrValOverflow);
             return NULL;
@@ -1124,12 +1039,11 @@ static const char* mmsigma_corr_field_fn(void* ctx, const char* name) {
         }
         return dst;
     }
-    if (fc->enrich != NULL) return mmsigma_enrich_lookup(fc->enrich, name, &vlen);
     return NULL;
 }
 
-/* Length-aware field lookup + parse. Turbo values are not always NUL-terminated
- * so we never strlen() a turbo pointer. */
+/* Length-aware field lookup + parse: a derived slice is not NUL-terminated,
+ * so the value is never strlen()ed. */
 static int mmsigma_parse_named_time(mmsigma_fieldctx_t* fc, const char* name, time_t now, double* out) {
     if (fc == NULL || name == NULL || name[0] == '\0') return 0;
     size_t vlen = 0;
@@ -1254,6 +1168,8 @@ BEGINcreateWrkrInstance
     pWrkrData->eval = NULL;
     pWrkrData->evalGen = 0;
     pWrkrData->prevReader = NULL;
+    pWrkrData->dbReader = NULL;
+    if (tf_store_init(&pWrkrData->tf) != 0) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
     {
         void* mem = NULL;
         if (posix_memalign(&mem, 64, sizeof(mmsigma_reader_t)) != 0) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
@@ -1319,6 +1235,7 @@ ENDfreeInstance
 
 BEGINfreeWrkrInstance
     CODESTARTfreeWrkrInstance;
+    tf_store_free(&pWrkrData->tf);
     if (pWrkrData->eval != NULL) {
         sigma_eval_free(pWrkrData->eval);
         pWrkrData->eval = NULL;
@@ -1506,8 +1423,8 @@ BEGINnewActInst
     /* Construct the output-module string request: a message-modification
      * module still MUST build the OMSR (rsyslog calls OMSRgetEntryCount on it
      * during action setup, a NULL OMSR segfaults the loader).  One entry,
-     * the whole message (we read pMsg->turbo_result in doAction, not a
-     * template string).  */
+     * the whole message (doAction reads fields from it, not a template
+     * string).  */
     CODE_STD_STRING_REQUESTnewActInst(1);
     CHKiRet(OMSRsetEntry(*ppOMSR, 0, NULL, OMSR_TPL_AS_MSG));
     CODE_STD_FINALIZERnewActInst;
@@ -1549,20 +1466,22 @@ BEGINdoAction_NoStrings
         if (db == NULL || db->n_rules == 0) FINALIZE; /* no ruleset yet, pass through */
         STATSCOUNTER_INC(ctrEvents, mutCtrEvents);
 
+        int hasSnapshot = 0, hasTree = 0;
+        MsgLock(pMsg);
 #ifdef HAVE_LOGNORM_TURBO
-        const ln_fast_result_t* r = NULL;
-        if (pMsg->turbo_result != NULL) {
-            const ln_fast_result_snapshot_t* snap = (const ln_fast_result_snapshot_t*)pMsg->turbo_result;
-            r = ln_fast_result_snapshot_get(snap);
-        }
-        if (r == NULL) {
-            /* The zero-copy arena is gone (the message crossed a duplicating
-             * queue boundary or was replayed from a disk queue).  The parsed
-             * fields were already materialized into $!, so matching falls back
-             * to the $! tree, slower per field, identical semantics.  Counted
-             * in impstats so a systematically degraded path is VISIBLE, never
-             * a silent no-op. */
-            if (pMsg->json == NULL) FINALIZE; /* nothing to match against */
+        hasSnapshot = pMsg->turbo_result != NULL;
+#endif
+        hasTree = pMsg->json != NULL;
+        MsgUnlock(pMsg);
+#ifdef HAVE_LOGNORM_TURBO
+        if (!hasSnapshot) {
+            /* The snapshot is gone (the message crossed a duplicating queue
+             * boundary or was replayed from a disk queue).  The parsed fields
+             * were already materialized into $!, which tf then reads for every
+             * field, slower per field, identical semantics.  Counted in
+             * impstats so a systematically degraded path is VISIBLE, never a
+             * silent no-op. */
+            if (!hasTree) FINALIZE; /* nothing to match against */
             STATSCOUNTER_INC(ctrTurboMissing, mutCtrTurboMissing);
             if (!bWarnedTurboMissing) {
                 bWarnedTurboMissing = 1;
@@ -1572,8 +1491,8 @@ BEGINdoAction_NoStrings
             }
         }
 #else
-        const void* r = NULL;
-        if (pMsg->json == NULL) FINALIZE;
+        (void)hasSnapshot;
+        if (!hasTree) FINALIZE;
 #endif
 
         /* (Re)bind the per-worker scratch to the current ruleset generation. */
@@ -1584,11 +1503,9 @@ BEGINdoAction_NoStrings
             if (pWrkrData->eval == NULL) FINALIZE;
         }
 
-        /* Field-resolution ctx: turbo arena (parsed, zero-copy) + the BORROWED
-         * $! root for enrichment fields. pMsg->json is mmenrich's
-         * enrichment tree; NULL when no $! exists yet (enrichment fields then
-         * simply miss, graceful). No deep copy: the msg is owned by this worker
-         * for the whole doAction. */
+        /* Field-resolution ctx: tf reads parsed and $! fields as terminated
+         * copies that stay valid for this event. */
+        tf_store_reset(&pWrkrData->tf);
         /* event.original fallback source: the pristine raw line, so fieldless
          * keyword rules match the full message even with no parser value. */
         uchar* pRawMsg = NULL;
@@ -1596,15 +1513,19 @@ BEGINdoAction_NoStrings
         getRawMsg(pMsg, &pRawMsg, &lenRawMsg);
         /* This worker's .prev snapshot: valid until its next enter. */
         const enrich_snap_t* prevSnap = pWrkrData->prevReader ? enrich_reader_enter(pWrkrData->prevReader) : NULL;
-        mmsigma_fieldctx_t fctx = {.r = r,
-                                   .enrich = pMsg->json,
+        mmsigma_fieldctx_t fctx = {.tf = {pMsg, &pWrkrData->tf, 0},
                                    .rawmsg = (const char*)pRawMsg,
                                    .rawmsg_len = (size_t)(lenRawMsg > 0 ? lenRawMsg : 0),
                                    .prev = prevSnap,
                                    .corr_arena = pWrkrData->corrVal,
                                    .corr_cap = sizeof(pWrkrData->corrVal)};
         sigma_hit_t hits[MMSIGMA_MAX_HITS];
+        /* The matcher only reads fields: one mutex hold for all of them.
+         * Nothing it calls takes the mutex (mmsigma_field_fn reads through
+         * tf_get in locked mode). */
+        tf_lock(&fctx.tf);
         int n = sigma_eval_run(pWrkrData->eval, mmsigma_field_fn, (void*)&fctx, hits, MMSIGMA_MAX_HITS);
+        tf_unlock(&fctx.tf);
         if (n <= 0) FINALIZE; /* no match, no output */
         STATSCOUNTER_INC(ctrMatchedEvents, mutCtrMatchedEvents);
 

@@ -79,6 +79,7 @@
  * and snapshot lifecycle, all provided here. */
 #include <lognorm-turbo.h>
 #include "ecs_derive.h" /* ECS derived-field layer (url.path ...) */
+#include "turbo_field.h" /* parsed fields as a template reads $! */
 #include "prev_live.h" /* this host's counter file; another process publishes it */
 #include "thrt_file_cache.h" /* process-wide inode-keyed MMDB cache */
 
@@ -473,6 +474,7 @@ typedef struct _instanceData {
 typedef struct wrkrInstanceData {
     instanceData* pData;
     enrich_reader_t* reader; /* this worker's view of pData->enrich */
+    tf_store_t tf; /* field values read for the current message */
 } wrkrInstanceData_t;
 
 /* Process-wide table caches. doAction never touches these. A replaced
@@ -595,6 +597,7 @@ ENDcreateInstance
 BEGINcreateWrkrInstance
     CODESTARTcreateWrkrInstance;
     pWrkrData->reader = NULL;
+    if (tf_store_init(&pWrkrData->tf) != 0) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
     if (pWrkrData->pData->enrich != NULL) {
         pWrkrData->reader = enrich_reader_new(pWrkrData->pData->enrich);
         if (pWrkrData->reader == NULL) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
@@ -675,6 +678,7 @@ BEGINfreeWrkrInstance
     CODESTARTfreeWrkrInstance;
     enrich_reader_free(pWrkrData->reader);
     pWrkrData->reader = NULL;
+    tf_store_free(&pWrkrData->tf);
 ENDfreeWrkrInstance
 
 BEGINdbgPrintInstInfo
@@ -1273,7 +1277,7 @@ BEGINnewActInst
                 pData->mappings[j].target = (uchar*)strdup(colon + 1);
 
                 /* Compute turbo_key: convert "!parsed!src_ip" -> "parsed.src_ip"
-                 * for direct ln_fast_result_get_string() access in hot path.
+                 * for the dotted field read (tf_get) in the hot path.
                  * Strip leading '!' then replace remaining '!' with '.' */
                 {
                     const char* src = mappingStr;
@@ -1655,7 +1659,7 @@ finalize_it:
  * Key-to-target mappings with an event-level summary + integrated GeoIP
  *
  * Hot path, for each mapping:
- *   1. Read the field value from ln_fast_result (flat array, no JSON walk)
+ *   1. Read the field value (tf_get: the turbo snapshot, or $! once written)
  *   2. enrich_lookup(): overlay, database and private-address policy
  *   3. Inject the per-field and party results at their target paths
  *   4. GeoIP for an address, unless it is private and geoip_skip_private
@@ -1671,11 +1675,8 @@ static void build_ecs_base(const uchar* turbo_key, char* out, size_t out_sz) {
 }
 #endif
 
-static rsRetVal process_lookup_mode_v4_mappings(instanceData* pData,
-                                                const enrich_snap_t* snap,
-                                                smsg_t* pMsg,
-                                                const ln_fast_result_t* turbo_result,
-                                                enrich_event_t* ev) {
+static rsRetVal process_lookup_mode_v4_mappings(
+    instanceData* pData, const enrich_snap_t* snap, smsg_t* pMsg, const tf_ctx_t* tf, enrich_event_t* ev) {
     DEFiRet;
     uint32_t lflags = enrich_lookup_flags(pData->enrich);
 
@@ -1700,8 +1701,7 @@ static rsRetVal process_lookup_mode_v4_mappings(instanceData* pData,
         size_t vlen = 0;
         enrich_result_t res;
 
-        if (!mapping->turbo_key ||
-            ln_fast_result_get_string(turbo_result, (const char*)mapping->turbo_key, &val, &vlen) != 0) {
+        if (!mapping->turbo_key || tf_get(tf, (const char*)mapping->turbo_key, &val, &vlen) != 0) {
             continue;
         }
         if (!val || vlen == 0) continue;
@@ -1859,7 +1859,7 @@ static prev_live_t* mmenrich_prev_live(void) {
     return live;
 }
 
-static void mmenrich_note_prevalence(const ln_fast_result_t* r) {
+static void mmenrich_note_prevalence(const tf_ctx_t* tf) {
     static const char* fields[] = {"dns.question.name", "destination.ip"};
     prev_live_t* live;
     const char* src = NULL;
@@ -1867,18 +1867,17 @@ static void mmenrich_note_prevalence(const ln_fast_result_t* r) {
     char sbuf[256];
     size_t i;
 
-    if (r == NULL) return;
     live = mmenrich_prev_live();
     if (live == NULL) return;
     sbuf[0] = '\0';
-    if (ln_fast_result_get_string(r, "source.ip", &src, &slen) == 0 && slen > 0 && slen < sizeof(sbuf)) {
+    if (tf_get(tf, "source.ip", &src, &slen) == 0 && slen > 0 && slen < sizeof(sbuf)) {
         memcpy(sbuf, src, slen);
         sbuf[slen] = '\0';
     }
     for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
         const char* sval = NULL;
         char kbuf[256];
-        if (ln_fast_result_get_string(r, fields[i], &sval, &slen) != 0) continue;
+        if (tf_get(tf, fields[i], &sval, &slen) != 0) continue;
         if (slen == 0 || slen >= sizeof(kbuf)) continue;
         memcpy(kbuf, sval, slen);
         kbuf[slen] = '\0';
@@ -1891,7 +1890,7 @@ static void mmenrich_note_prevalence(const ln_fast_result_t* r) {
  * $!. 0 = absent = rarest (the signal a Sigma rule thresholds, ideally ANDed
  * with entropy or beaconing). Skipped entirely while the table is unwarmed
  * (count_max == 0), so a cold table never flags every domain as rare. */
-static void mmenrich_emit_prevalence(smsg_t* pMsg, const ln_fast_result_t* r, const enrich_snap_t* snap) {
+static void mmenrich_emit_prevalence(smsg_t* pMsg, const tf_ctx_t* tf, const enrich_snap_t* snap) {
     static const struct {
         const char* field;
         const char* count_path; /* _prevalence: occurrences on every edge (first-seen signal) */
@@ -1917,7 +1916,7 @@ static void mmenrich_emit_prevalence(smsg_t* pMsg, const ln_fast_result_t* r, co
         size_t slen = 0;
         enrich_prev_t pv;
         int rc;
-        if (ln_fast_result_get_string(r, obs[i].field, &sval, &slen) != 0) continue; /* field absent */
+        if (tf_get(tf, obs[i].field, &sval, &slen) != 0) continue; /* field absent */
         if (slen == 0 || slen >= 256) continue; /* empty or implausibly long */
         /* One lookup yields the total count, the distinct-edge spread
          * and the distinct-internal-source count. 0 = no warmed table: a
@@ -1934,7 +1933,7 @@ static void mmenrich_emit_prevalence(smsg_t* pMsg, const ln_fast_result_t* r, co
     }
 }
 
-static void mmenrich_emit_derived_ecs(smsg_t* pMsg, const ln_fast_result_t* r) {
+static void mmenrich_emit_derived_ecs(smsg_t* pMsg, const tf_ctx_t* tf) {
     /* Source-first, memoized per contiguous group. The table is grouped by
      * source field (ecs_derive_table.def documents this as contract), so a
      * whole group costs ONE arena probe when its source is absent, instead of
@@ -1956,14 +1955,13 @@ static void mmenrich_emit_derived_ecs(smsg_t* pMsg, const ln_fast_result_t* r) {
 
         if (grp_src == NULL || strcmp(grp_src, e->source) != 0) {
             grp_src = e->source;
-            ghit = (ln_fast_result_get_string(r, e->source, &gval, &glen) == 0);
+            ghit = (tf_get(tf, e->source, &gval, &glen) == 0);
         }
         if (!ghit) continue; /* source absent - nothing in this group to derive */
         sval = gval;
         slen = glen;
 
-        if (ln_fast_result_get_string(r, e->derived, &dval, &dlen) == 0)
-            continue; /* already produced by the parser - leave it */
+        if (tf_get(tf, e->derived, &dval, &dlen) == 0) continue; /* already produced by the parser - leave it */
         dval = NULL;
         dlen = 0;
         if (!ecs_derive_apply(e->transform, sval, slen, &dval, &dlen, dbuf, sizeof dbuf)) continue;
@@ -1979,16 +1977,16 @@ static void mmenrich_emit_derived_ecs(smsg_t* pMsg, const ln_fast_result_t* r) {
 
 /* Emit $!shellcode = true when the raw message carries an escaped payload
  * (thrt_payload.h). Runs in both modes, so a downstream module reads the
- * flag instead of scanning the message again. r is the turbo result and may
- * be NULL in pattern mode: the URL pre-filter is then skipped. Nothing is
+ * flag instead of scanning the message again. Without url.original (pattern
+ * mode without mmnormalize) the URL pre-filter is skipped. Nothing is
  * emitted for a clean message. */
-static void mmenrich_emit_shellcode(const instanceData* pData, smsg_t* pMsg, const ln_fast_result_t* r) {
+static void mmenrich_emit_shellcode(const instanceData* pData, smsg_t* pMsg, const tf_ctx_t* tf) {
     const char* url = NULL;
     size_t url_len = 0;
     const char* raw = (const char*)pMsg->pszRawMsg;
     size_t raw_len = pMsg->iLenRawMsg;
 
-    if (r != NULL && ln_fast_result_get_string(r, "url.original", &url, &url_len) != 0) {
+    if (tf_get(tf, "url.original", &url, &url_len) != 0) {
         url = NULL;
         url_len = 0;
     }
@@ -2042,8 +2040,11 @@ BEGINdoAction_NoStrings
     smsg_t* pMsg = ppMsg[0];
     instanceData* pData = pWrkrData->pData;
     struct json_object* jFinalReport = NULL;
+    tf_ctx_t tfc = {pMsg, &pWrkrData->tf, 0};
+    const tf_ctx_t* const tf = &tfc;
     CODESTARTdoAction;
     STATSCOUNTER_INC(ctrEvents, mutCtrEvents);
+    tf_store_reset(&pWrkrData->tf);
 
     /* This worker's snapshot of the .thrt, overlay and .prev. Two loads when
      * nothing was reloaded since the last message. A missing file is a
@@ -2070,12 +2071,9 @@ BEGINdoAction_NoStrings
             process_pattern_mode(pData, esnap, msgContent, msgLen, &jFinalReport);
         }
 
-        /* mmnormalize is optional in pattern mode. With turbo on, its
+        /* mmnormalize is optional in pattern mode. When it ran, its
          * url.original drives the same static-asset pre-filter as lookup. */
-        const ln_fast_result_t* pr = NULL;
-        if (pMsg->turbo_result != NULL)
-            pr = ln_fast_result_snapshot_get((const ln_fast_result_snapshot_t*)pMsg->turbo_result);
-        mmenrich_emit_shellcode(pData, pMsg, pr);
+        mmenrich_emit_shellcode(pData, pMsg, tf);
 
         /* process_pattern_mode only adds a category key to jFinalReport when a
          * mined IOC carried CTI meta (a confirmed threat); a report with >=1 key
@@ -2085,27 +2083,40 @@ BEGINdoAction_NoStrings
             STATSCOUNTER_INC(ctrCtiHits, mutCtrCtiHits);
 
     } else {
-        /* Lookup Mode - turbo_result is REQUIRED for both paths.
-         * turbo_result is now a snapshot (deep copy), extract the result. */
-        if (pMsg->turbo_result == NULL) {
+        /* Lookup Mode - the turbo parse is REQUIRED. Fields are read through
+         * tf, which also sees $! writes made after the parse. */
+        if (!tf_has_snapshot(pMsg)) {
             LogError(0, RS_RET_ERR,
                      "mmenrich: turbo_result is NULL - mmnormalize must have turbo=\"on\" enabled. "
                      "Add turbo=\"on\" to your mmnormalize action.");
             ABORT_FINALIZE(RS_RET_ERR);
         }
-        const ln_fast_result_snapshot_t* snap = (const ln_fast_result_snapshot_t*)pMsg->turbo_result;
-        const ln_fast_result_t* r = ln_fast_result_snapshot_get(snap);
-        if (r == NULL) {
-            LogError(0, RS_RET_ERR, "mmenrich: snapshot has no result - internal error");
-            ABORT_FINALIZE(RS_RET_ERR);
+
+        /* Every field this action reads, under one mutex hold; the reads
+         * below are then answered from the store. A derived field is read
+         * only when its source is present, as mmenrich_emit_derived_ecs()
+         * does. */
+        {
+            static const char* const fixed[] = {"source.ip",           "dns.question.name", "destination.ip",
+                                                "user_agent.original", "url.domain",        "url.original"};
+            const char* v;
+            size_t l;
+            tf_lock(&tfc);
+            for (size_t k = 0; k < sizeof(fixed) / sizeof(fixed[0]); k++) (void)tf_get(tf, fixed[k], &v, &l);
+            for (int k = 0; k < pData->numMappings; k++)
+                if (pData->mappings[k].turbo_key) (void)tf_get(tf, (const char*)pData->mappings[k].turbo_key, &v, &l);
+            for (size_t di = 0; di < ECS_DERIVE_COUNT; di++)
+                if (tf_get(tf, ecs_derive_table[di].source, &v, &l) == 0)
+                    (void)tf_get(tf, ecs_derive_table[di].derived, &v, &l);
+            tf_unlock(&tfc);
         }
 
         /* ECS derived fields into $! (log/consumer symmetry). */
-        mmenrich_emit_derived_ecs(pMsg, r);
+        mmenrich_emit_derived_ecs(pMsg, tf);
 
         /* Count first, then emit. Counting runs while the image is still cold. */
-        mmenrich_note_prevalence(r);
-        mmenrich_emit_prevalence(pMsg, r, esnap);
+        mmenrich_note_prevalence(tf);
+        mmenrich_emit_prevalence(pMsg, tf, esnap);
 
         /* UA identification. Field absent is not empty. */
         if (pData->uaPath) {
@@ -2113,8 +2124,8 @@ BEGINdoAction_NoStrings
             size_t ualen = 0;
             ua_class_t uacl;
             ua_table_t* uat = MMENRICH_ATOMIC_LOAD(&pData->uaTable, __ATOMIC_ACQUIRE);
-            if (ln_fast_result_get_string(r, "user_agent.original", &ua, &ualen) == 0 &&
-                ua_classify(uat, ua, ualen, &uacl) == 0 && uacl.kind != UA_KIND_NONE) {
+            if (tf_get(tf, "user_agent.original", &ua, &ualen) == 0 && ua_classify(uat, ua, ualen, &uacl) == 0 &&
+                uacl.kind != UA_KIND_NONE) {
                 if (uacl.cls) {
                     struct json_object* jcls = json_object_new_string(uacl.cls);
                     if (jcls) msgAddJSON(pMsg, (uchar*)"!user_agent!threat", jcls, 0, 0);
@@ -2131,8 +2142,8 @@ BEGINdoAction_NoStrings
             size_t hostlen = 0;
             tld_class_t tldcl;
             tld_table_t* tldt = MMENRICH_ATOMIC_LOAD(&pData->tldTable, __ATOMIC_ACQUIRE);
-            if (ln_fast_result_get_string(r, "url.domain", &host, &hostlen) == 0 &&
-                tld_classify(tldt, host, hostlen, &tldcl) == 0 && tldcl.kind != TLD_KIND_NONE) {
+            if (tf_get(tf, "url.domain", &host, &hostlen) == 0 && tld_classify(tldt, host, hostlen, &tldcl) == 0 &&
+                tldcl.kind != TLD_KIND_NONE) {
                 if (tldcl.cls) {
                     struct json_object* jcls = json_object_new_string(tldcl.cls);
                     if (jcls) msgAddJSON(pMsg, (uchar*)"!url!tld_class", jcls, 0, 0);
@@ -2143,7 +2154,7 @@ BEGINdoAction_NoStrings
         /* V4 MAPPINGS PATH: turbo-accelerated field extraction + direct target injection.
          * Mappings are mandatory for LOOKUP mode (validated at config time). */
         enrich_event_t ev;
-        process_lookup_mode_v4_mappings(pData, esnap, pMsg, r, &ev);
+        process_lookup_mode_v4_mappings(pData, esnap, pMsg, tf, &ev);
 
         /* ev.match is the OR of every mapping's CTI, CTI_R or overlay add
          * match - increment cti.hits exactly once per matching event. */
@@ -2186,7 +2197,7 @@ BEGINdoAction_NoStrings
             }
         }
 
-        mmenrich_emit_shellcode(pData, pMsg, r);
+        mmenrich_emit_shellcode(pData, pMsg, tf);
     }
 
     /* Inject turbo lookup results into message */
