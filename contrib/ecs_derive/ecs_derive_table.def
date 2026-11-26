@@ -1,0 +1,74 @@
+/* ecs_derive_table.def: the ONE declarative ECS derived-field contract.
+ *
+ * X-macro table for the C derive layer (ecs_derive.h): the single declarative
+ * source of truth for which ECS fields a rulebase can produce or derive, so
+ * "advertised ECS field == produced-or-derivable ECS field" stays true and
+ * dead Sigma rules can't hide behind an over-claimed KNOWN_ECS_FIELDS.
+ *
+ *   ECS_DERIVE(derived_field, source_field, transform)
+ *     derived_field  ECS field this row produces (string literal)
+ *     source_field   ECS field it reads, must be one a rulebase actually emits
+ *     transform      ecs_derive_transform_t (see ecs_derive.h)
+ *
+ * Adding a row makes `derived_field` resolvable to the matcher AND emitted into
+ * $! for the stored-log query path, symmetrically, with no liblognorm
+ * snapshot/ABI change (derivation runs in our module code, not the parser).
+ *
+ * Elastic-ingest analogue: this is a URL/grok-style processor set.
+ */
+
+/* ROW ORDER IS PART OF THE CONTRACT: rows are GROUPED BY SOURCE FIELD.
+ * mmenrich_emit_derived_ecs walks this table on every event and probes the
+ * source once per contiguous group, so a group costs one arena lookup instead
+ * of one per row. Adding a row to an existing group is therefore free at
+ * runtime for sources that do not carry that field; splitting a group in two
+ * silently doubles its cost. Keep same-source rows adjacent.
+ */
+
+/* --- source: url.original (nginx / proxy request URI) --------------------- */
+
+/* url.path <- url.original.  an nginx rulebase captures nginx $uri into
+ * url.original; $uri is path-only, so for nginx this is the whole string. The
+ * URL_PATH transform truncates at '?'/'#', so it is ALSO correct the day a
+ * full-URL source emits scheme://host/path?query into url.original. */
+ECS_DERIVE("url.path", "url.original", ECS_XF_URL_PATH)
+
+/* HTTP structural anomaly features, derived from url.original (webserver/proxy
+ * rulebases emit the request URI there). Each is a COMPUTED integer a Sigma rule
+ * can threshold at line rate: length (long encoded payloads), pct_count (encoding
+ * obfuscation), special_count (SQLi/XSS/cmdi metacharacter density), and
+ * traversal_count (LFI / path traversal). They generalize across attack variants
+ * without enumerating signatures, and feed $! for the stored-log hunt path. */
+ECS_DERIVE("url.original_length", "url.original", ECS_XF_URL_LENGTH)
+ECS_DERIVE("url.original_pct_count", "url.original", ECS_XF_URL_PCT_COUNT)
+ECS_DERIVE("url.original_special_count", "url.original", ECS_XF_URL_SPECIAL_COUNT)
+ECS_DERIVE("url.original_traversal_count", "url.original", ECS_XF_URL_TRAVERSAL_COUNT)
+
+/* --- source: event.action (every firewall-shaped source) ------------------
+ *
+ * Firewalls disagree on what to call the same two outcomes: pf logs
+ * pass/block, iptables ACCEPT/DROP, haproxy allow. Keying a detection on the
+ * vendor verb makes it a per-vendor rule, which is why the bundled firewall
+ * rules fired on OPNsense and were dead on every iptables edge.
+ *
+ * ECS already separates the two concepts: event.action keeps the vendor verb
+ * for forensics, event.type carries the normalized categorization. Deriving
+ * event.type here makes one rule cover every firewall, and a new vendor is a
+ * row in the transform's map rather than an edit to every rule.
+ *
+ * auth.rulebase emits event.type directly (start/end for session records), and
+ * the emitter skips a row whose derived field is already present, so this only
+ * ever fills it in for sources that leave it empty. */
+ECS_DERIVE("event.type", "event.action", ECS_XF_FW_DISPOSITION)
+
+/* --- source: dns.question.name (dns rulebase) ----------------------------- */
+
+/* DGA / algorithmically-generated-domain features, derived from the DNS query
+ * name (dns.rulebase emits dns.question.name). Each is a COMPUTED integer so a
+ * Sigma rule can threshold it at line rate, e.g. a DGA rule combining
+ * `dns.question.name_entropy | gte 380` (3.8 bits/char) with a long-label or
+ * digit-ratio condition. Subdomain-pressure (distinct labels per parent over a
+ * window) is a value_count correlation, not a per-event feature. */
+ECS_DERIVE("dns.question.name_entropy", "dns.question.name", ECS_XF_DNS_ENTROPY)
+ECS_DERIVE("dns.question.name_digit_ratio", "dns.question.name", ECS_XF_DNS_DIGIT_RATIO)
+ECS_DERIVE("dns.question.name_max_label", "dns.question.name", ECS_XF_DNS_MAX_LABEL)
