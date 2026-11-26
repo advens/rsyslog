@@ -87,6 +87,7 @@
 #include <sigma/classify_corr.h> /* libsigma correlator */
 #include <sigma/corr_format.h> /* rules.corr.json loader (the only json-dep part) */
 #include <sigma/contrib_wire.h> /* $!sigma_contribution JSON */
+#include "mmsigma_contrib.h" /* what an emitted partial carries */
 #include <json.h>
 #include <sigma/event_time.h> /* event-time parse for correlation windows */
 
@@ -614,6 +615,7 @@ static void mmsigma_emit_contribs(
     for (i = 0; i < nr; i++) {
         const corr_rule_t* r = corr_engine_rule_at(eng, i);
         int kind;
+        const char* const* gfields;
         const char* gvals[CORR_MAX_GROUP_FIELDS];
         size_t g;
         corr_contrib_t c;
@@ -621,8 +623,9 @@ static void mmsigma_emit_contribs(
         if (!r || corr_rule_hits(r, rids, n_rids) == 0) continue;
         kind = corr_contrib_kind_for(r->type);
         if (kind < 0) continue;
+        gfields = mmsigma_contrib_group_fields(r, rids, n_rids);
         for (g = 0; g < r->n_group_by && g < CORR_MAX_GROUP_FIELDS; g++) {
-            gvals[g] = mmsigma_corr_field_fn(fc, r->group_by[g]);
+            gvals[g] = gfields != NULL ? mmsigma_corr_field_fn(fc, gfields[g]) : NULL;
             if (gvals[g] == NULL) break;
         }
         if (g < r->n_group_by) continue;
@@ -635,14 +638,16 @@ static void mmsigma_emit_contribs(
         c.n_group = r->n_group_by;
         c.ts = ts;
         if (kind == (int)CORR_CONTRIB_COUNT) c.count = 1;
+        /* Send no value the owner's engine would skip on a local event. */
         if (kind == (int)CORR_CONTRIB_SUM) {
             const char* vs = r->value_field ? mmsigma_corr_field_fn(fc, r->value_field) : NULL;
-            char* end = NULL;
+            if (!mmsigma_contrib_number(vs, &c.numeric)) continue;
             c.count = 1;
-            if (vs) c.numeric = strtod(vs, &end);
         }
-        if (kind == (int)CORR_CONTRIB_DISTINCT)
+        if (kind == (int)CORR_CONTRIB_DISTINCT) {
             c.value = r->value_field ? mmsigma_corr_field_fn(fc, r->value_field) : NULL;
+            if (c.value == NULL) continue;
+        }
         if (kind == (int)CORR_CONTRIB_SEEN) c.seen_mask = mmsigma_seen_mask(r, rids, n_rids);
         jo = corr_contrib_to_json(&c, pData->originId ? (const char*)pData->originId : NULL);
         if (jo) {

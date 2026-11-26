@@ -5,7 +5,7 @@
 #
 # Usage:
 #   make -f Makefile.dev module-check
-#   make -f Makefile.dev test          # ecs_derive only; engine tests via matcher
+#   make -f Makefile.dev test          # ecs_derive and contrib; engine tests via matcher
 #
 # Author: Jeremie Jourdin <jeremie.jourdin@advens.fr>
 
@@ -24,6 +24,8 @@ JSON_INC       ?= /opt/homebrew/include
 # Point these at libsigma and libenrich source trees.
 LIBSIGMA_ROOT  ?= $(error set LIBSIGMA_ROOT to a libsigma source tree)
 LIBSIGMA_SRC   ?= $(LIBSIGMA_ROOT)/src
+# Directory holding sigma/classify_corr.h (an install prefix's include/).
+LIBSIGMA_INC   ?= $(error set LIBSIGMA_INC to a directory holding sigma/*.h)
 ENRICH_SRC     ?= $(error set ENRICH_SRC to a libenrich src/ directory)
 
 .PHONY: test module-check matcher tsan fuzz libfuzz clean
@@ -38,6 +40,8 @@ module-check:
 test: $(BUILD) matcher
 	$(CC) $(CFLAGS) -I../ecs_derive test_ecs_derive.c -lm -o $(BUILD)/test_ecs_derive
 	$(BUILD)/test_ecs_derive
+	$(CC) $(CFLAGS) -I. -I$(LIBSIGMA_INC) test_mmsigma_contrib.c -lm -o $(BUILD)/test_mmsigma_contrib
+	$(BUILD)/test_mmsigma_contrib
 
 matcher:
 	$(MAKE) -C $(LIBSIGMA_ROOT) test
