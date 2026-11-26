@@ -34,11 +34,9 @@ mmenrich_archflags_arm64   = -march=armv8-a+crc
 MMENRICH_ARCHFLAGS = $(mmenrich_archflags_@host_cpu@)
 
 # liblognorm turbo is REQUIRED (mmenrich has no slow fallback path).
-# ecs_derive.h (shared ECS derived-field layer, emitted into $!) is staged by
-# the port into contrib/ecs_derive (post-extract) and reached via
-# -I$(srcdir)/../ecs_derive, the same way mmsigma includes it. (The upstream
-# fork keeps ecs_derive.h in runtime/ and reaches it via RSRT_CFLAGS; this port
-# relocates it, so the include path differs here.)
+# ecs_derive.h (shared ECS derived-field layer, emitted into $!) is in
+# contrib/ecs_derive and reached via -I$(srcdir)/../ecs_derive, the same way
+# mmsigma includes it. The top-level Makefile.am distributes it.
 mmenrich_la_CPPFLAGS = $(RSRT_CFLAGS) $(PTHREADS_CFLAGS) $(JSON_C_CFLAGS) $(LIBLOGNORM_CFLAGS) $(LIBENRICH_CFLAGS) -I$(srcdir)/../ecs_derive
 mmenrich_la_CFLAGS = $(AM_CFLAGS) $(MMENRICH_ARCHFLAGS)
 mmenrich_la_LDFLAGS = -module -avoid-version
@@ -80,6 +78,5 @@ EXTRA_DIST = fuzz_miner.c \
              test_thrt_payload.c \
              test_thrt_tld.c \
              test_thrt_ua.c \
-             tests/cti_fold_idempotency.py \
              prev_write.py \
              Makefile.dev
