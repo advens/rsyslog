@@ -1821,6 +1821,13 @@ if test "x$enable_mmnormalize" = "xyes"; then
 					[liblognorm exposes ln_fast_result_is_truncated()])
 				lognorm_turbo_truncation_supported="yes"],
 				[], [[#include <lognorm-turbo.h>]])
+			# ln_fast_result_find() tells an absent field from one the
+			# snapshot holds in another form, so a $! read of a missing
+			# field skips the JSON tree.
+			AC_CHECK_DECL([ln_fast_result_find],
+				[AC_DEFINE(HAVE_LN_FAST_RESULT_FIND, 1,
+					[liblognorm exposes ln_fast_result_find()])],
+				[], [[#include <lognorm-turbo.h>]])
 		fi
 		if test "x$enable_turbo" = "xyes" -a "x$lognorm_turbo_supported" != "xyes"; then
 			if test "x$lognorm_turbo_header_missing" = "xyes"; then

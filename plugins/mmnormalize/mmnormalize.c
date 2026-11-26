@@ -496,7 +496,11 @@ static void turbo_result_to_json_cb(void *result_ptr, struct json_object **json)
  *   - Replace remaining '!' with '.' (liblognorm uses dot separator)
  *   - Stack buffer: no malloc, max MMNORM_MAX_FIELDNAME bytes
  *
- * Returns 0 on hit (val/vlen set, zero-copy into snapshot), -1 on miss.
+ * Returns 0 for a string (val/vlen set, zero-copy into the snapshot), 2 for
+ * an integer (val/vlen hold its decimal text in a per-thread buffer), -1 when
+ * the snapshot holds nothing at the path, and 1 when the caller must read the
+ * JSON tree built from the snapshot (another type, a nested object, a name
+ * the tree build merges). Without ln_fast_result_find() a miss is 1.
  */
 static int turbo_result_get_str_cb(
     void *result_ptr, const uchar *name, int nameLen, const uchar **val, rs_size_t *vlen) {
@@ -505,19 +509,19 @@ static int turbo_result_get_str_cb(
     char keybuf[MMNORM_MAX_FIELDNAME];
     int keylen;
 
-    if (snap == NULL) return -1;
+    if (snap == NULL) return 1;
 
     r = ln_fast_result_snapshot_get(snap);
-    if (r == NULL) return -1;
+    if (r == NULL) return 1;
 
     /* Convert rsyslog path to liblognorm key.
      * pProp->name is "!sns!src" (leading ! = CEE root, ! separators).
      * liblognorm uses "sns.src" (dot separators, no root prefix).
      * Skip first char (!), replace ! with . */
-    if (nameLen < 2 || name[0] != '!') return -1; /* bare "!" = full tree request, not a single field */
+    if (nameLen < 2 || name[0] != '!') return 1; /* bare "!" = full tree request, not a single field */
 
     keylen = nameLen - 1; /* skip leading '!' */
-    if (keylen >= (int)sizeof(keybuf)) return -1;
+    if (keylen >= (int)sizeof(keybuf)) return 1;
 
     const uchar *src = name + 1;
     for (int i = 0; i < keylen; i++) keybuf[i] = (src[i] == '!') ? '.' : (char)src[i];
@@ -525,8 +529,35 @@ static int turbo_result_get_str_cb(
 
     const char *sval;
     size_t slen;
+    #ifdef HAVE_LN_FAST_RESULT_FIND
+    int64_t ival;
+    switch (ln_fast_result_find(r, keybuf, (size_t)keylen, &sval, &slen, &ival)) {
+        case LN_FIND_STRING:
+            break;
+        case LN_FIND_INT: {
+            /* decimal, as the JSON build prints it */
+            static __thread char ibuf[24];
+            uint64_t u = ival < 0 ? (uint64_t)0 - (uint64_t)ival : (uint64_t)ival;
+            char *d = ibuf + sizeof(ibuf) - 1;
+            *d = '\0';
+            do {
+                *--d = (char)('0' + u % 10);
+                u /= 10;
+            } while (u != 0);
+            if (ival < 0) *--d = '-';
+            *val = (const uchar *)d;
+            *vlen = (rs_size_t)(ibuf + sizeof(ibuf) - 1 - d);
+            return 2;
+        }
+        case LN_FIND_ABSENT:
+            return -1;
+        default:
+            return 1;
+    }
+    #else
     if (ln_fast_result_get_string(r, keybuf, &sval, &slen) != 0)
-        return -1; /* field not in snapshot -> fall through to json */
+        return 1; /* not a string here: the JSON tree decides */
+    #endif
 
     *val = (const uchar *)sval;
     *vlen = (rs_size_t)slen;

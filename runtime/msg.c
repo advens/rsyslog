@@ -768,6 +768,10 @@ static rsRetVal msgBaseConstruct(smsg_t **ppThis) {
     pM->turbo_result_get_str = NULL;
     pM->turbo_result_refs = NULL;
     pM->turbo_json_ready = 0;
+    pM->turbo_written = NULL;
+    pM->turbo_written_mask = 0;
+    pM->turbo_written_n = 0;
+    pM->turbo_written_all = 0;
 #endif
     pM->dfltTZ[0] = '\0';
     memset(&pM->tRcvdAt, 0, sizeof(pM->tRcvdAt));
@@ -882,8 +886,230 @@ void MsgReleaseTurboResult(smsg_t *const pMsg) {
     pMsg->turbo_result_get_str = NULL;
     pMsg->turbo_result_refs = NULL;
     pMsg->turbo_json_ready = 0;
+    free(pMsg->turbo_written);
+    pMsg->turbo_written = NULL;
+    pMsg->turbo_written_mask = 0;
+    pMsg->turbo_written_n = 0;
+    pMsg->turbo_written_all = 0;
+}
+
+    #define TURBO_WRITTEN_MAX 64
+
+/* $! lookups ignore case, so a write to $!Source!IP must cover a read of
+ * source.ip: paths are hashed case-folded. strcasecmp() folds by the locale,
+ * and a module may set one where 'I' or 'i' matches a byte above 0x7f
+ * (tr_TR), so those bytes share one class. Every class is wider than case
+ * alone, which only sends more reads to the tree. */
+    #if defined(__GNUC__) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        #define TURBO_PATH_HASH_WORDS 1
+    #endif
+
+    /* The path hashes rely on unsigned wrap-around in their multiplies,
+     * which is well defined; keep the CI sanitizer's
+     * unsigned-integer-overflow check out of them. */
+    #if defined(__clang__)
+        #define TURBO_HASH_WRAPS __attribute__((no_sanitize("unsigned-integer-overflow")))
+    #else
+        #define TURBO_HASH_WRAPS
+    #endif
+
+    #ifdef TURBO_PATH_HASH_WORDS
+        #define TURBO_W_ONES 0x0101010101010101ULL
+        #define TURBO_W_HIGH 0x8080808080808080ULL
+
+/* The high bit of each byte of w that equals c. */
+static inline uint64_t msgTurboWordEq(const uint64_t w, const uchar c) {
+    const uint64_t x = w ^ (TURBO_W_ONES * c);
+    return ~(((x & ~TURBO_W_HIGH) + ~TURBO_W_HIGH) | x) & TURBO_W_HIGH;
+}
+
+/* Fold eight bytes: set bit 5 of each byte, which lowers 'A'..'Z' (and pairs
+ * a few punctuation bytes, which is harmless), then turn every byte above
+ * 0x7f into 'i'. 'I' and 'i' are already one class. */
+static inline uint64_t msgTurboWordFold(const uint64_t w) {
+    const uint64_t cls = (w & TURBO_W_HIGH) >> 7;
+    const uint64_t f = w | (TURBO_W_ONES * 0x20);
+    return (f & ~(cls * 0xff)) | (cls * 'i');
+}
+
+/* Keep the first k bytes of a little-endian word, k <= 8. */
+static inline uint64_t msgTurboWordKeep(const uint64_t w, const size_t k) {
+    return k >= 8 ? w : k == 0 ? 0 : w & (~0ULL >> (64 - 8 * k));
+}
+
+/* The hash of the path prefix p[0, e), e >= 1, from its length and its
+ * folded first, middle and last eight bytes, which cover every byte of a
+ * path up to 24 bytes. head is the folded first word of the whole path. */
+TURBO_HASH_WRAPS static inline uint32_t msgTurboPrefixHash(const uchar *const p, const size_t e, const uint64_t head) {
+    uint64_t w, x;
+    x = (msgTurboWordKeep(head, e) ^ ((uint64_t)e * 0x9e3779b97f4a7c15ULL)) * 0xbf58476d1ce4e5b9ULL;
+    if (e > 8) {
+        memcpy(&w, p + e - 8, 8);
+        x = (x ^ (x >> 31) ^ msgTurboWordFold(w)) * 0x94d049bb133111ebULL;
+    }
+    if (e > 16) {
+        memcpy(&w, p + (e - 8) / 2, 8);
+        x = (x ^ (x >> 29) ^ msgTurboWordFold(w)) * 0xbf58476d1ce4e5b9ULL;
+    }
+    /* the filter takes the low bits: bring the high ones down */
+    x = (x ^ (x >> 31)) * 0x94d049bb133111ebULL;
+    return (uint32_t)(x ^ (x >> 32));
+}
+    #else
+/* FNV-1a over folded bytes. */
+TURBO_HASH_WRAPS static inline uint32_t msgTurboPathHashStep(uint32_t h, const uchar c) {
+    return (h ^ (uint32_t)(c >= 0x80 ? 'i' : (c | 0x20))) * 16777619u;
+}
+    #endif
+
+static inline int msgTurboWrittenHas(const smsg_t *const pMsg, const uint32_t h) {
+    if (!(pMsg->turbo_written_mask & ((uint64_t)1 << (h & 63)))) return 0;
+    for (unsigned i = 0; i < pMsg->turbo_written_n; ++i)
+        if (pMsg->turbo_written[i] == h) return 1;
+    return 0;
+}
+
+/* Hash the $! path name[0, len) into *full. With pMsg set, stop and return 1
+ * as soon as a parent of the path (a prefix ending before a '!' or '[' past
+ * the leading '!') is in the written set. Must be called with pMsg->mut held
+ * when pMsg is set. */
+static int msgTurboPathScan(const smsg_t *const pMsg, const uchar *const name, const size_t len, uint32_t *const full) {
+    #ifdef TURBO_PATH_HASH_WORDS
+    uint64_t head = 0;
+    if (len >= 8)
+        memcpy(&head, name, 8);
+    else
+        memcpy(&head, name, len);
+    head = msgTurboWordFold(head);
+    if (pMsg != NULL) {
+        for (size_t off = 0; off < len; off += 8) {
+            const size_t r = len - off;
+            uint64_t w = 0;
+            if (r >= 8)
+                memcpy(&w, name + off, 8);
+            else if (len >= 8) {
+                memcpy(&w, name + len - 8, 8);
+                w >>= 8 * (8 - r);
+            } else
+                memcpy(&w, name, len);
+            /* zero padding never matches */
+            uint64_t b = msgTurboWordEq(w, '!') | msgTurboWordEq(w, '[');
+            if (r < 8) b &= ~0ULL >> (64 - 8 * r);
+            while (b != 0) {
+                const size_t e = off + ((unsigned)__builtin_ctzll(b) >> 3);
+                b &= b - 1;
+                if (e > 0 && msgTurboWrittenHas(pMsg, msgTurboPrefixHash(name, e, head))) return 1;
+            }
+        }
+    }
+    *full = msgTurboPrefixHash(name, len, head);
+    return 0;
+    #else
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; ++i) {
+        if (pMsg != NULL && i > 0 && (name[i] == '!' || name[i] == '[') && msgTurboWrittenHas(pMsg, h)) return 1;
+        h = msgTurboPathHashStep(h, name[i]);
+    }
+    *full = h;
+    return 0;
+    #endif
+}
+
+/* Record that the $! path name ("!source!ip", or "!" for the root) was
+ * written or unset while a snapshot is attached. Field reads then take that
+ * path and everything below it from pMsg->json. A root write, a failed
+ * allocation or a full set sets turbo_written_all, which sends every read to
+ * the tree: slower, never wrong. Must be called with pMsg->mut held. */
+static void msgTurboNoteWrite(smsg_t *const pMsg, const uchar *const name) {
+    uint32_t h;
+
+    if (pMsg->turbo_result == NULL || pMsg->turbo_written_all) return;
+    if (name[1] == '\0') {
+        pMsg->turbo_written_all = 1;
+        return;
+    }
+    (void)msgTurboPathScan(NULL, name, strlen((const char *)name), &h);
+    if (msgTurboWrittenHas(pMsg, h)) return;
+    if (pMsg->turbo_written_n == TURBO_WRITTEN_MAX) {
+        pMsg->turbo_written_all = 1;
+        return;
+    }
+    if (pMsg->turbo_written == NULL) {
+        pMsg->turbo_written = malloc(TURBO_WRITTEN_MAX * sizeof(*pMsg->turbo_written));
+        if (pMsg->turbo_written == NULL) {
+            pMsg->turbo_written_all = 1;
+            return;
+        }
+    }
+    pMsg->turbo_written[pMsg->turbo_written_n++] = h;
+    pMsg->turbo_written_mask |= (uint64_t)1 << (h & 63);
+}
+
+/* 1 when the $! path name or one of its parents was written or unset since
+ * the snapshot was attached (set $!source replaces source.ip). A hash
+ * collision answers 1: the caller then reads the tree, which is always
+ * right. A written child of name needs no check: name is then a container,
+ * and only strings are read. Must be called with pMsg->mut held. */
+static int msgTurboWritten(const smsg_t *const pMsg, const uchar *const name, const size_t len) {
+    uint32_t h;
+
+    if (pMsg->turbo_written_all) return 1;
+    if (pMsg->turbo_written_n == 0) return 0;
+    if (msgTurboPathScan(pMsg, name, len, &h)) return 1;
+    return msgTurboWrittenHas(pMsg, h);
+}
+
+/* Store in out[] the hashes msgTurboWritten() looks up for the $! path
+ * name[0, len): one per parent, then the path's own. Returns their count,
+ * or 0 when there are more than max. */
+static unsigned msgTurboPathHashes(const uchar *const name, const size_t len, uint32_t *const out, const unsigned max) {
+    unsigned n = 0;
+    #ifdef TURBO_PATH_HASH_WORDS
+    uint64_t head = 0;
+    memcpy(&head, name, len >= 8 ? 8 : len);
+    head = msgTurboWordFold(head);
+    for (size_t e = 1; e < len; ++e) {
+        if (name[e] != '!' && name[e] != '[') continue;
+        if (n + 1 >= max) return 0;
+        out[n++] = msgTurboPrefixHash(name, e, head);
+    }
+    out[n++] = msgTurboPrefixHash(name, len, head);
+    #else
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; ++i) {
+        if (i > 0 && (name[i] == '!' || name[i] == '[')) {
+            if (n + 1 >= max) return 0;
+            out[n++] = h;
+        }
+        h = msgTurboPathHashStep(h, name[i]);
+    }
+    out[n++] = h;
+    #endif
+    return n;
+}
+
+/* msgTurboWritten() for a path prepared by msgJSONKeyInit(). Must be called
+ * with pMsg->mut held. */
+static int msgTurboWrittenKey(const smsg_t *const pMsg, const msgJSONKey_t *const key) {
+    if (pMsg->turbo_written_all) return 1;
+    if (!(pMsg->turbo_written_mask & key->bits)) return 0;
+    for (unsigned i = 0; i < key->n; ++i)
+        if (msgTurboWrittenHas(pMsg, key->hash[i])) return 1;
+    return 0;
 }
 #endif
+
+void msgJSONKeyInit(msgJSONKey_t *const key, const uchar *const name, const size_t nameLen) {
+    memset(key, 0, sizeof(*key));
+    key->len = nameLen;
+#ifdef HAVE_LOGNORM_TURBO
+    if (nameLen < 2 || name[0] != '!') return;
+    key->n = (unsigned char)msgTurboPathHashes(name, nameLen, key->hash, MSG_JSON_KEY_HASHES);
+    for (unsigned i = 0; i < key->n; ++i) key->bits |= (uint64_t)1 << (key->hash[i] & 63);
+#else
+    (void)name;
+#endif
+}
 
 rsRetVal msgDestruct(smsg_t **ppThis) {
     DEFiRet;
@@ -1131,6 +1357,20 @@ ENDobjDestruct
     }
 #ifdef HAVE_LOGNORM_TURBO
     pNew->turbo_json_ready = pOld->turbo_json_ready;
+    if (pNew->turbo_result != NULL) {
+        pNew->turbo_written_all = pOld->turbo_written_all;
+        if (pOld->turbo_written_n > 0) {
+            /* without the set the copy reads every field from its tree */
+            pNew->turbo_written = malloc(TURBO_WRITTEN_MAX * sizeof(*pNew->turbo_written));
+            if (pNew->turbo_written == NULL) {
+                pNew->turbo_written_all = 1;
+            } else {
+                memcpy(pNew->turbo_written, pOld->turbo_written, pOld->turbo_written_n * sizeof(*pOld->turbo_written));
+                pNew->turbo_written_n = pOld->turbo_written_n;
+                pNew->turbo_written_mask = pOld->turbo_written_mask;
+            }
+        }
+    }
 #endif
     MsgUnlock(pOld);
 
@@ -3160,6 +3400,24 @@ static int msgMaterializeTurboJSON(smsg_t *pMsg) {
         json_object_put(pMsg->json);
         pMsg->json = snap_json;
     } else {
+        /* The keys already in the tree are writes the snapshot does not
+         * know about: msgGetJSONPropStr() must read a path under them from
+         * the tree. */
+        struct json_object_iterator pit = json_object_iter_begin(pMsg->json);
+        struct json_object_iterator pitEnd = json_object_iter_end(pMsg->json);
+        while (!json_object_iter_equal(&pit, &pitEnd)) {
+            uchar path[256];
+            const char *const key = json_object_iter_peek_name(&pit);
+            const size_t klen = strlen(key);
+            if (klen + 2 > sizeof(path)) {
+                pMsg->turbo_written_all = 1;
+                break;
+            }
+            path[0] = '!';
+            memcpy(path + 1, key, klen + 1);
+            msgTurboNoteWrite(pMsg, path);
+            json_object_iter_next(&pit);
+        }
         /* Keep msgAddJSON() full-tree merge semantics: the normalization
          * result is the later write and therefore replaces matching keys. */
         struct json_object_iterator it = json_object_iter_begin(snap_json);
@@ -3441,6 +3699,100 @@ finalize_it:
     RETiRet;
 }
 
+
+rsRetVal msgGetJSONPropStrLocked(smsg_t *const pMsg,
+                                 const uchar *const name,
+                                 const size_t nameLen,
+                                 const msgJSONKey_t *const key,
+                                 uchar *const buf,
+                                 const size_t bufLen,
+                                 size_t *const valLen) {
+    struct json_object *parent, *leafnode;
+    const char *val = NULL;
+    size_t vlen = 0;
+    uchar *leaf;
+    DEFiRet;
+
+    if (name[0] != '!' || nameLen < 2 || nameLen > INT_MAX || bufLen == 0) return RS_RET_INVALID_PARAMS;
+#ifdef HAVE_LOGNORM_TURBO
+    if (pMsg->turbo_result != NULL && pMsg->turbo_result_get_str != NULL) {
+        const uchar *tval;
+        rs_size_t tlen;
+        /* A tree that predates the attach is merged first: the merge records
+         * its top-level keys as written, so the check below sends a path
+         * under one of them to the tree. */
+        if (pMsg->json != NULL && !msgMaterializeTurboJSON(pMsg)) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+        /* A path not written since the attach holds what the snapshot holds:
+         * the snapshot is the latest write of every field it has. */
+        const int keyed = key != NULL && key->n > 0 && key->len == nameLen;
+        if (pMsg->json == NULL || !(keyed ? msgTurboWrittenKey(pMsg, key) : msgTurboWritten(pMsg, name, nameLen))) {
+            switch (pMsg->turbo_result_get_str(pMsg->turbo_result, name, (int)nameLen, &tval, &tlen)) {
+                case 0: /* a string */
+                case 2: /* an integer, in decimal */
+                    val = (const char *)tval;
+                    vlen = (size_t)tlen;
+                    goto copy;
+                case -1: /* nothing at the path */
+                    ABORT_FINALIZE(RS_RET_NOT_FOUND);
+                default: /* another form: the tree built from the snapshot says */
+                    break;
+            }
+        }
+        if (!msgMaterializeTurboJSON(pMsg)) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    }
+#else
+    (void)key;
+#endif
+    if (pMsg->json == NULL) ABORT_FINALIZE(RS_RET_NOT_FOUND);
+    /* the path helpers read name and never write through it */
+    leaf = jsonPathGetLeaf((uchar *)name, (int)nameLen);
+    iRet = jsonPathFindParent(pMsg->json, (uchar *)name, leaf, &parent, 0);
+    if (iRet == RS_RET_JNAME_INVALID) iRet = RS_RET_NOT_FOUND; /* a parent is missing or not an object */
+    if (iRet != RS_RET_OK) FINALIZE;
+    if (!jsonVarExtract(parent, (const char *)leaf, &leafnode) || leafnode == NULL) ABORT_FINALIZE(RS_RET_NOT_FOUND);
+    switch (json_object_get_type(leafnode)) {
+        case json_type_string:
+            val = json_object_get_string(leafnode);
+            vlen = (size_t)json_object_get_string_len(leafnode);
+            break;
+        case json_type_int:
+        case json_type_boolean:
+        case json_type_double:
+            /* the text a template prints for a scalar (same formatter) */
+            val = jsonToString(leafnode);
+            if (val == NULL) ABORT_FINALIZE(RS_RET_NOT_FOUND);
+            vlen = strlen(val);
+            break;
+        case json_type_null:
+        case json_type_object:
+        case json_type_array:
+        default:
+            ABORT_FINALIZE(RS_RET_NOT_FOUND);
+    }
+#ifdef HAVE_LOGNORM_TURBO
+copy:
+#endif
+    *valLen = vlen;
+    if (vlen >= bufLen) ABORT_FINALIZE(RS_RET_PROVIDED_BUFFER_TOO_SMALL);
+    memcpy(buf, val, vlen);
+    buf[vlen] = '\0';
+
+finalize_it:
+    RETiRet;
+}
+
+rsRetVal msgGetJSONPropStr(smsg_t *const pMsg,
+                           const uchar *const name,
+                           const size_t nameLen,
+                           uchar *const buf,
+                           const size_t bufLen,
+                           size_t *const valLen) {
+    rsRetVal iRet;
+    MsgLock(pMsg);
+    iRet = msgGetJSONPropStrLocked(pMsg, name, nameLen, NULL, buf, bufLen, valLen);
+    MsgUnlock(pMsg);
+    return iRet;
+}
 
 /* Get a JSON-based variable as an expression value.
  *
@@ -5407,9 +5759,12 @@ rsRetVal msgAddJSON(smsg_t *const pM, uchar *name, struct json_object *json, int
     pthread_mutex_lock(mut);
 #ifdef HAVE_LOGNORM_TURBO
     /* only $! carries the snapshot; for $/ mut is not the message mutex */
-    if (name[0] == '!' && !msgMaterializeTurboJSON(pM)) {
-        json_object_put(json); /* ownership of json is ours once the root lookup succeeded */
-        ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+    if (name[0] == '!') {
+        if (!msgMaterializeTurboJSON(pM)) {
+            json_object_put(json); /* ownership of json is ours once the root lookup succeeded */
+            ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+        }
+        msgTurboNoteWrite(pM, name);
     }
 #endif
 
@@ -5514,6 +5869,8 @@ rsRetVal msgDelJSON(smsg_t *const pM, uchar *name) {
             MsgReleaseTurboResult(pM);
         } else if (!msgMaterializeTurboJSON(pM)) {
             ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
+        } else {
+            msgTurboNoteWrite(pM, name);
         }
     }
 #endif
