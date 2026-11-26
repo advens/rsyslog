@@ -1,0 +1,53 @@
+# Makefile.dev: local inner-loop for the rsyslog mmsigma glue.
+# The engine (match, correlator, CLI, fuzz) lives in libsigma.
+#
+# Usage:
+#   make -f Makefile.dev module-check
+#   make -f Makefile.dev test          # ecs_derive only; engine tests via matcher
+#
+# Author: Jeremie Jourdin <jeremie.jourdin@advens.fr>  (Apache-2.0)
+
+CC      ?= clang
+CSTD    := -std=c11
+WARN    := -Wall -Wextra -Wpedantic
+HARDEN  := -fstack-protector-strong -D_FORTIFY_SOURCE=2
+OPT     := -O2
+CFLAGS  := $(CSTD) $(WARN) $(HARDEN) $(OPT)
+BUILD   := build
+
+RSYSLOG_SRC    ?= $(abspath ../..)
+LIBLOGNORM_SRC ?= $(error set LIBLOGNORM_SRC to a liblognorm src/ directory)
+JSON_INC       ?= /opt/homebrew/include
+
+# Point these at libsigma and libenrich source trees.
+LIBSIGMA_ROOT  ?= $(error set LIBSIGMA_ROOT to a libsigma source tree)
+LIBSIGMA_SRC   ?= $(LIBSIGMA_ROOT)/src
+ENRICH_SRC     ?= $(error set ENRICH_SRC to a libenrich src/ directory)
+
+.PHONY: test module-check matcher tsan fuzz libfuzz clean
+
+module-check:
+	$(CC) -fsyntax-only -DHAVE_CONFIG_H -DHAVE_LOGNORM_TURBO -fno-strict-aliasing -pthread \
+	  -I. -I$(LIBSIGMA_SRC) -I$(ENRICH_SRC) -I../ecs_derive -I../mmenrich \
+	  -I$(RSYSLOG_SRC) -I$(RSYSLOG_SRC)/runtime -I$(RSYSLOG_SRC)/grammar \
+	  -I$(JSON_INC) -I$(JSON_INC)/libfastjson -I$(LIBLOGNORM_SRC) \
+	  -W -Wall -Wextra mmsigma.c && echo "mmsigma.c: compile-check OK"
+
+test: $(BUILD) matcher
+	$(CC) $(CFLAGS) -I../ecs_derive test_ecs_derive.c -lm -o $(BUILD)/test_ecs_derive
+	$(BUILD)/test_ecs_derive
+
+matcher:
+	$(MAKE) -C $(LIBSIGMA_ROOT) test
+
+tsan:
+	$(MAKE) -C $(LIBSIGMA_FILES) -f Makefile.port tsan
+
+fuzz libfuzz:
+	$(MAKE) -C $(LIBSIGMA_FILES) -f Makefile.port libfuzz
+
+$(BUILD):
+	@mkdir -p $(BUILD)
+
+clean:
+	rm -rf $(BUILD) crash-* leak-* timeout-*

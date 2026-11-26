@@ -423,6 +423,11 @@ if ENABLE_MMENRICH
 SUBDIRS += contrib/mmenrich
 endif
 
+# mmsigma (Sigma matching and correlation)
+if ENABLE_MMSIGMA
+SUBDIRS += contrib/mmsigma
+endif
+
 # tests are added as last element, because tests may need different
 # modules that need to be generated first
 SUBDIRS += tests

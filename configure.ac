@@ -1963,6 +1963,24 @@ fi
 AM_CONDITIONAL(ENABLE_MMENRICH, test x$enable_mmenrich = xyes)
 AM_CONDITIONAL(MMENRICH_GEOIP_SUPPORTED, test x$have_mmenrich_geoip = xyes)
 
+# mmsigma: line-rate Sigma rule matching and correlation, on libsigma.
+AC_ARG_ENABLE(mmsigma,
+        [AS_HELP_STRING([--enable-mmsigma],[Enable line-rate Sigma matcher build+tests @<:@default=no@:>@])],
+        [case "${enableval}" in
+        yes) enable_mmsigma="yes" ;;
+        no) enable_mmsigma="no" ;;
+        *) AC_MSG_ERROR(bad value ${enableval} for --enable-mmsigma) ;;
+        esac],
+        [enable_mmsigma=no]
+)
+if test "x$enable_mmsigma" = "xyes"; then
+        PKG_CHECK_MODULES([LIBSIGMA], [sigma], [],
+                [AC_MSG_ERROR([mmsigma requires libsigma (pkg-config sigma); install libsigma])])
+        PKG_CHECK_MODULES([LIBENRICH], [enrich], [],
+                [AC_MSG_ERROR([mmsigma requires libenrich (pkg-config enrich); install libenrich])])
+fi
+AM_CONDITIONAL(ENABLE_MMSIGMA, test x$enable_mmsigma = xyes)
+
 # mmnjsonparse
 AC_ARG_ENABLE(mmjsonparse,
         [AS_HELP_STRING([--enable-mmjsonparse],[Enable building mmjsonparse support @<:@default=no@:>@])],
@@ -3952,6 +3970,7 @@ AC_CONFIG_FILES([Makefile \
 		contrib/pmdb2diag/Makefile \
 		contrib/imhiredis/Makefile \
 		contrib/mmenrich/Makefile \
+		contrib/mmsigma/Makefile \
 		tests/set-envvars \
 		tests/Makefile])
 AC_OUTPUT
