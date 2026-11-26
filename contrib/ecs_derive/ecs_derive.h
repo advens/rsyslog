@@ -123,12 +123,59 @@ static const ecs_derive_entry_t ecs_derive_table[] = {
 };
 #define ECS_DERIVE_COUNT (sizeof(ecs_derive_table) / sizeof(ecs_derive_table[0]))
 
+/* Some DNS server debug logs write a query name in wire form: each label
+ * is preceded by its length in parentheses, and (0) ends the name, as in
+ * (3)www(7)example(3)com(0). The DNS features describe the name, not its
+ * encoding. Measured on the wire form, the length markers add digits and
+ * parentheses to every name, which raises its entropy and digit ratio, and
+ * the longest label spans the whole name. ecs__dns_wire_decode writes the
+ * dotted name (www.example.com) into dst and returns its length. It returns
+ * 0 for a value that is not well-formed wire form, or that decodes to more
+ * than a DNS name holds, and the caller then measures the value as written. */
+#define ECS_DNS_NAME_MAX 255
+#define ECS_DNS_LABEL_MAX 63
+static inline size_t ecs__dns_wire_decode(const char *s, size_t n, char *dst, size_t cap) {
+    size_t i = 0, o = 0;
+    if (n < 3 || s[0] != '(') return 0;
+    while (i < n) {
+        size_t len = 0, digits = 0;
+        if (s[i] != '(') return 0;
+        i++;
+        while (i < n && digits < 3 && s[i] >= '0' && s[i] <= '9') {
+            len = len * 10 + (size_t)(s[i] - '0');
+            i++;
+            digits++;
+        }
+        if (digits == 0 || i >= n || s[i] != ')') return 0;
+        i++;
+        if (len == 0) return i == n ? o : 0; /* (0) ends the name */
+        if (len > ECS_DNS_LABEL_MAX || len > n - i) return 0;
+        if (o > 0) {
+            if (o >= cap) return 0;
+            dst[o++] = '.';
+        }
+        if (len > cap - o) return 0;
+        memcpy(dst + o, s + i, len);
+        o += len;
+        i += len;
+    }
+    return o; /* the terminator was cut off: the labels are still whole */
+}
+
 /* Apply one transform to a borrowed source value (val,vlen). SLICE transforms
  * set (*out,*out_len) to a borrowed slice of `val`; COMPUTED transforms format
  * an integer into `buf` (>= ECS_DERIVE_BUFSZ) and point *out there. Returns 1 on
  * success, 0 for an unknown transform id. */
 static inline __attribute__((always_inline)) int ecs_derive_apply(
     int xf, const char *val, size_t vlen, const char **out, size_t *out_len, char *buf, size_t bufcap) {
+    char dnsname[ECS_DNS_NAME_MAX];
+    if (xf == ECS_XF_DNS_ENTROPY || xf == ECS_XF_DNS_DIGIT_RATIO || xf == ECS_XF_DNS_MAX_LABEL) {
+        size_t dl = ecs__dns_wire_decode(val, vlen, dnsname, sizeof dnsname);
+        if (dl > 0) {
+            val = dnsname;
+            vlen = dl;
+        }
+    }
     switch (xf) {
         case ECS_XF_URL_PATH: {
             size_t n = vlen;

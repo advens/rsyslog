@@ -103,6 +103,27 @@ int main(void) {
     CK(apply_int(ECS_XF_DNS_MAX_LABEL, "nodots") == 6, "max_label(nodots) == 6");
     CK(apply_int(ECS_XF_DNS_MAX_LABEL, "") == 0, "max_label(empty) == 0");
 
+    /* --- DNS wire form: measured as the dotted name --- */
+    CK(apply_int(ECS_XF_DNS_MAX_LABEL, "(3)www(7)example(3)com(0)") == 7, "wire max_label == 7");
+    CK(apply_int(ECS_XF_DNS_ENTROPY, "(3)www(7)example(3)com(0)") == apply_int(ECS_XF_DNS_ENTROPY, "www.example.com"),
+       "wire entropy == dotted entropy");
+    CK(apply_int(ECS_XF_DNS_DIGIT_RATIO, "(3)www(6)google(3)com(0)") == 0, "wire digit_ratio == 0");
+    CK(apply_int(ECS_XF_DNS_MAX_LABEL, "(3)www(7)example(3)com") == 7, "wire without (0) still decodes");
+    CK(apply_int(ECS_XF_DNS_MAX_LABEL, "(9)ab(0)") == 8, "bad label length: measured as written");
+    CK(apply_int(ECS_XF_DNS_MAX_LABEL, "(2)ab(0)x") == 9, "text after (0): measured as written");
+    CK(apply_int(ECS_XF_DNS_MAX_LABEL, "(0)") == 3, "root only: measured as written");
+    {
+        char wire[600], label[64];
+        size_t o = 0;
+        memset(label, 'a', 63);
+        label[63] = '\0';
+        for (int k = 0; k < 5; k++) o += (size_t)snprintf(wire + o, sizeof wire - o, "(63)%s", label);
+        snprintf(wire + o, sizeof wire - o, "(0)");
+        CK(apply_int(ECS_XF_DNS_MAX_LABEL, wire) == (long)strlen(wire), "name over 255 bytes: as written");
+        snprintf(wire, sizeof wire, "(64)%sa(0)", label);
+        CK(apply_int(ECS_XF_DNS_MAX_LABEL, wire) == (long)strlen(wire), "label over 63 bytes: as written");
+    }
+
     /* --- COMPUTED: HTTP structural features --- */
     CK(apply_int(ECS_XF_URL_LENGTH, "abcd") == 4, "url length == 4");
     CK(apply_int(ECS_XF_URL_LENGTH, "") == 0, "url length(empty) == 0");
