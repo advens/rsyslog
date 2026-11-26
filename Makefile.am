@@ -21,6 +21,9 @@ EXTRA_DIST = \
 	contrib/gnutls/ca.pem \
 	contrib/gnutls/cert.pem \
 	contrib/gnutls/key.pem \
+	contrib/ecs_derive/ecs_derive.h \
+	contrib/ecs_derive/ecs_derive_table.def \
+	contrib/ecs_derive/test_ecs_derive.c \
 	scripts/generate_distro_component_map.py \
 	devtools/release/validate-rpm-baseline-patches.py \
 	devtools/release/upstream_patch_detect.py \
