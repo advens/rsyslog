@@ -418,6 +418,11 @@ if ENABLE_IMHIREDIS
 SUBDIRS += contrib/imhiredis
 endif
 
+# mmenrich
+if ENABLE_MMENRICH
+SUBDIRS += contrib/mmenrich
+endif
+
 # tests are added as last element, because tests may need different
 # modules that need to be generated first
 SUBDIRS += tests

@@ -1871,6 +1871,98 @@ AC_ARG_ENABLE(mmleefparse,
 )
 AM_CONDITIONAL(ENABLE_MMLEEFPARSE, test x$enable_mmleefparse = xyes)
 
+# mmenrich: line-rate enrichment (CTI, GeoIP, ECS, IOC). It adds facts and
+# never scores.
+AC_ARG_ENABLE(mmenrich,
+        [AS_HELP_STRING([--enable-mmenrich],[Enable line-rate log enrichment helper @<:@default=no@:>@])],
+        [case "${enableval}" in
+        yes) enable_mmenrich="yes" ;;
+        no) enable_mmenrich="no" ;;
+        *) AC_MSG_ERROR(bad value ${enableval} for --enable-mmenrich) ;;
+        esac],
+        [enable_mmenrich=no]
+)
+
+if test "x$enable_mmenrich" = "xyes"; then
+    PKG_CHECK_MODULES([LIBENRICH], [enrich], [],
+            [AC_MSG_ERROR([mmenrich requires libenrich (pkg-config enrich); install libenrich])])
+
+    # SIMD capability detection (informational, not required)
+    AC_MSG_CHECKING([for SIMD support in mmenrich])
+    have_mmenrich_simd="scalar fallback"
+
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+            #if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+            #else
+            #error "Not ARM64"
+            #endif
+            ]], [[]])],
+            [
+                    have_mmenrich_simd="NEON"
+                    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+                            #if defined(__ARM_FEATURE_CRC32)
+                            #else
+                            #error "No CRC32"
+                            #endif
+                            ]], [[]])],
+                            [have_mmenrich_simd="NEON + CRC32"],
+                            []
+                    )
+            ],
+            [
+                    save_CFLAGS="$CFLAGS"
+                    CFLAGS="$CFLAGS -msse4.2"
+                    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+                            #include <nmmintrin.h>
+                            ]], [[
+                            unsigned int crc = _mm_crc32_u32(0, 0);
+                            ]])],
+                            [have_mmenrich_simd="SSE4.2 (CRC32C)"],
+                            []
+                    )
+                    CFLAGS="$save_CFLAGS"
+
+                    if test "x$have_mmenrich_simd" != "xscalar fallback"; then
+                            save_CFLAGS="$CFLAGS"
+                            CFLAGS="$CFLAGS -mavx2"
+                            AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+                                    #include <immintrin.h>
+                                    ]], [[
+                                    __m256i v = _mm256_setzero_si256();
+                                    ]])],
+                                    [have_mmenrich_simd="SSE4.2 + AVX2"],
+                                    []
+                            )
+                            CFLAGS="$save_CFLAGS"
+                    fi
+            ]
+    )
+
+    AC_MSG_RESULT([$have_mmenrich_simd])
+    AC_DEFINE_UNQUOTED([MMENRICH_SIMD_SUPPORT], ["$have_mmenrich_simd"], [SIMD acceleration available for mmenrich])
+
+    if test "x$have_mmenrich_simd" != "xscalar fallback"; then
+            AC_MSG_NOTICE([mmenrich will use $have_mmenrich_simd acceleration])
+    else
+            AC_MSG_NOTICE([mmenrich will use scalar fallback (slower but functional)])
+    fi
+
+    AC_CHECK_HEADERS([maxminddb.h], [
+        AC_CHECK_LIB([maxminddb], [MMDB_open], [
+            have_mmenrich_geoip="yes"
+            AC_DEFINE(HAVE_MMENRICH_GEOIP, 1, [mmenrich integrated GeoIP support])
+        ], [have_mmenrich_geoip="no"])
+    ], [have_mmenrich_geoip="no"])
+    if test "x$have_mmenrich_geoip" = "xyes"; then
+            AC_MSG_NOTICE([mmenrich will include integrated GeoIP support (libmaxminddb)])
+    else
+            AC_MSG_NOTICE([mmenrich without GeoIP support (libmaxminddb not found)])
+    fi
+fi
+
+AM_CONDITIONAL(ENABLE_MMENRICH, test x$enable_mmenrich = xyes)
+AM_CONDITIONAL(MMENRICH_GEOIP_SUPPORTED, test x$have_mmenrich_geoip = xyes)
+
 # mmnjsonparse
 AC_ARG_ENABLE(mmjsonparse,
         [AS_HELP_STRING([--enable-mmjsonparse],[Enable building mmjsonparse support @<:@default=no@:>@])],
@@ -3859,6 +3951,7 @@ AC_CONFIG_FILES([Makefile \
 		contrib/imdocker/Makefile \
 		contrib/pmdb2diag/Makefile \
 		contrib/imhiredis/Makefile \
+		contrib/mmenrich/Makefile \
 		tests/set-envvars \
 		tests/Makefile])
 AC_OUTPUT

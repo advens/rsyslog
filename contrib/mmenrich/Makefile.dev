@@ -1,0 +1,152 @@
+# Makefile.dev: local (macOS/Linux) inner-loop compile-check for mmenrich,
+# the log-enrichment rsyslog module. This is NOT the
+# rsyslog build: it only syntax-checks the module glue (mmenrich.c) against a
+# configured rsyslog source tree so module/skeleton errors are caught locally
+# in seconds instead of via CI. The autotools Makefile.am wires mmenrich into
+# the rsyslog tree.
+#
+# Usage:
+#   make -f Makefile.dev module-check    # compile-check mmenrich.c
+#   make -f Makefile.dev san             # header-only suites + miner fuzz (+ASan/UBSan)
+#   make -f Makefile.dev fuzz            # differential SIMD miner fuzz (+ASan/UBSan)
+#   make -f Makefile.dev test-payload    # payload classification helpers (+ASan/UBSan)
+#   make -f Makefile.dev clean
+#
+# One-time setup: configure an rsyslog source tree once so config.h exists:
+#     cd $RSYSLOG_SRC && autoreconf -fi && ./configure --disable-testbench
+# (turbo field is gated by HAVE_LOGNORM_TURBO, defined here for the check.)
+# GeoIP is part of mmenrich's enrichment surface, so the check defines
+# HAVE_MMENRICH_GEOIP and adds /opt/homebrew/include for maxminddb.h.
+# The .thrt headers come from a libenrich source tree: set ENRICH_SRC to its
+# src/ directory.
+#
+# Author: Jérémie Jourdin - <jeremie.jourdin@advens.fr>  (LGPL-3.0-or-later)
+
+CC      ?= clang
+
+RSYSLOG_SRC    ?= $(abspath ../..)
+LIBLOGNORM_SRC ?= $(error set LIBLOGNORM_SRC to a liblognorm src/ directory)
+
+# json-c: Homebrew on macOS, distro prefix on Linux.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+JSON_INC ?= /opt/homebrew/include
+JSON_LIB ?= -L/opt/homebrew/lib -ljson-c
+else
+JSON_INC ?= /usr/include
+JSON_LIB ?= -ljson-c
+endif
+
+.PHONY: module-check fuzz test-cache test-derive test-ua test-tld test-party test-payload helpers san clean
+
+ENRICH_SRC ?= $(error set ENRICH_SRC to a libenrich src/ directory)
+
+module-check:
+	$(CC) -fsyntax-only -DHAVE_CONFIG_H -DHAVE_LOGNORM_TURBO \
+	  -DHAVE_MMENRICH_GEOIP -fno-strict-aliasing -pthread \
+	  -I. -I../ecs_derive -I$(ENRICH_SRC) -I$(RSYSLOG_SRC) -I$(RSYSLOG_SRC)/runtime \
+	  -I$(RSYSLOG_SRC)/grammar -I$(JSON_INC) -I$(JSON_INC)/libfastjson \
+	  -I$(LIBLOGNORM_SRC) -I/opt/homebrew/include \
+	  -W -Wall -Wextra mmenrich.c && echo "mmenrich.c: compile-check OK"
+
+# Differential SIMD fuzz for the pattern-mode IOC miner: proves mine_iocs_simd
+# (AVX2 on x86-64, NEON on aarch64; -march=native picks the host path) is
+# bit-identical to the scalar reference over an adversarial + boundary-straddling
+# corpus. The anti-TurboVM soundness gate for the miner. Self-contained: the
+# thrt_miner.h/thrt_payload.h headers and libenrich's thrt_logic.h/thrt_format.h
+# pull in no rsyslog or json.
+fuzz:
+	$(CC) -std=c11 -Wall -Wextra -O2 -march=native -I$(ENRICH_SRC) fuzz_miner.c -o fuzz_miner
+	./fuzz_miner
+	@echo "--- fuzz under ASan/UBSan ---"
+	$(CC) -std=c11 -Wall -Wextra -O1 -g -march=native -fsanitize=address,undefined \
+	  -I$(ENRICH_SRC) fuzz_miner.c -o fuzz_miner_san
+	./fuzz_miner_san
+
+# Inode-keyed snapshot cache (process-wide CTI/GeoIP/.prev maps).
+# glibc + -std=c11 hides POSIX (mkstemp, symlink); Darwin does not.
+test-cache:
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O2 -pthread -I. \
+	  thrt_file_cache.c test_file_cache.c -o test_file_cache
+	./test_file_cache
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O1 -g -pthread \
+	  -fsanitize=address,undefined -I. \
+	  thrt_file_cache.c test_file_cache.c -o test_file_cache_san
+	./test_file_cache_san
+
+# ECS derive contract: transform behaviour (incl. the LOWER case-fold eve proto
+# needs) and the table shape the per-event emitter's cost model depends on.
+# Header-only, so no rsyslog or json includes needed. glibc needs -lm for
+# log2; Darwin libc already provides it (mmenrich-san failed without this).
+test-derive:
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -I. -I../ecs_derive \
+	  test_ecs_derive.c -lm -o test_ecs_derive
+	./test_ecs_derive
+	$(CC) -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined -I. -I../ecs_derive \
+	  test_ecs_derive.c -lm -o test_ecs_derive_san
+	./test_ecs_derive_san
+
+# UA identification table. Header-only; needs json-c / libfastjson.
+test-ua:
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -I. -I$(JSON_INC)/json-c \
+	  test_thrt_ua.c $(JSON_LIB) -o test_thrt_ua
+	./test_thrt_ua
+	$(CC) -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined -I. -I$(JSON_INC)/json-c \
+	  test_thrt_ua.c $(JSON_LIB) -o test_thrt_ua_san
+	./test_thrt_ua_san
+
+# ua_lookup and tld_lookup stay in this package. enrich and thrtutil
+# are the libenrich package.
+helpers:
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -march=native -I. -I$(JSON_INC)/json-c \
+	  ua_lookup.c $(JSON_LIB) -o ua_lookup
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -march=native -I. -I$(JSON_INC)/json-c \
+	  tld_lookup.c $(JSON_LIB) -o tld_lookup
+	@echo "helpers: ua_lookup tld_lookup"
+
+# TLD identification table (url.domain last label). Header-only; needs json-c.
+test-tld:
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -I. -I$(JSON_INC)/json-c \
+	  test_thrt_tld.c $(JSON_LIB) -o test_thrt_tld
+	./test_thrt_tld
+	$(CC) -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined -I. -I$(JSON_INC)/json-c \
+	  test_thrt_tld.c $(JSON_LIB) -o test_thrt_tld_san
+	./test_thrt_tld_san
+
+# Party threat scalars. Header-only; needs json-c and the libenrich format header.
+# enrich.h pulls in the libenrich headers: the POSIX file API (glibc hides it
+# under plain -std=c11) and the CRC32C path, which warns without -march.
+test-party:
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Werror -O2 -march=native -I. -I$(ENRICH_SRC) \
+	  -I$(JSON_INC)/json-c test_party_threat.c $(JSON_LIB) -o test_party_threat
+	./test_party_threat
+	$(CC) -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -O1 -g -march=native -fsanitize=address,undefined \
+	  -I. -I$(ENRICH_SRC) -I$(JSON_INC)/json-c test_party_threat.c $(JSON_LIB) -o test_party_threat_san
+	./test_party_threat_san
+
+# Payload classification, also usable by other modules. Header-only, libc only.
+test-payload:
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -I. test_thrt_payload.c -o test_thrt_payload
+	./test_thrt_payload
+	$(CC) -std=c11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
+	  -fno-sanitize-recover=undefined -I. test_thrt_payload.c -o test_thrt_payload_san
+	./test_thrt_payload_san
+
+# CI and the local inner loop: every header-only suite
+# plus the miner fuzz, each already compiled a second time under ASan/UBSan.
+test-prev-live:
+	python3 -I prev_write.py conformance.prev >/dev/null
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -O1 -g -march=native -fsanitize=address,undefined \
+	  -I. -I$(ENRICH_SRC) test_prev_live.c prev_live.c -o test_prev_live_san
+	./test_prev_live_san conformance.prev
+
+san: test-derive test-cache test-ua test-tld test-party test-payload test-prev-live fuzz
+
+clean:
+	rm -f *.o fuzz_miner fuzz_miner_san test_file_cache test_file_cache_san \
+	  test_ecs_derive test_ecs_derive_san \
+	  test_thrt_ua test_thrt_ua_san test_thrt_tld test_thrt_tld_san \
+	  test_party_threat test_party_threat_san \
+	  test_thrt_payload test_thrt_payload_san \
+	  ua_lookup tld_lookup
+	rm -rf *.dSYM
