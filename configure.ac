@@ -1974,8 +1974,8 @@ AC_ARG_ENABLE(mmsigma,
         [enable_mmsigma=no]
 )
 if test "x$enable_mmsigma" = "xyes"; then
-        PKG_CHECK_MODULES([LIBSIGMA], [sigma], [],
-                [AC_MSG_ERROR([mmsigma requires libsigma (pkg-config sigma); install libsigma])])
+        PKG_CHECK_MODULES([LIBSIGMA], [sigma >= 4.2.0], [],
+                [AC_MSG_ERROR([mmsigma requires libsigma 4.2.0 or later (pkg-config sigma)])])
         PKG_CHECK_MODULES([LIBENRICH], [enrich], [],
                 [AC_MSG_ERROR([mmsigma requires libenrich (pkg-config enrich); install libenrich])])
 fi
