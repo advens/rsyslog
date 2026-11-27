@@ -168,14 +168,6 @@ static inline size_t ecs__dns_wire_decode(const char *s, size_t n, char *dst, si
  * success, 0 for an unknown transform id. */
 static inline __attribute__((always_inline)) int ecs_derive_apply(
     int xf, const char *val, size_t vlen, const char **out, size_t *out_len, char *buf, size_t bufcap) {
-    char dnsname[ECS_DNS_NAME_MAX];
-    if (xf == ECS_XF_DNS_ENTROPY || xf == ECS_XF_DNS_DIGIT_RATIO || xf == ECS_XF_DNS_MAX_LABEL) {
-        size_t dl = ecs__dns_wire_decode(val, vlen, dnsname, sizeof dnsname);
-        if (dl > 0) {
-            val = dnsname;
-            vlen = dl;
-        }
-    }
     switch (xf) {
         case ECS_XF_URL_PATH: {
             size_t n = vlen;
@@ -251,7 +243,11 @@ static inline __attribute__((always_inline)) int ecs_derive_apply(
             return 1;
         }
         case ECS_XF_DNS_ENTROPY: {
-            long v = ecs__shannon_x100(val, vlen);
+            /* The dotted name lives in this case's own buffer, which a
+             * COMPUTED result never points into. */
+            char dnsname[ECS_DNS_NAME_MAX];
+            size_t dl = ecs__dns_wire_decode(val, vlen, dnsname, sizeof dnsname);
+            long v = dl > 0 ? ecs__shannon_x100(dnsname, dl) : ecs__shannon_x100(val, vlen);
             int n = snprintf(buf, bufcap, "%ld", v);
             if (n < 0 || (size_t)n >= bufcap) return 0;
             *out = buf;
@@ -259,12 +255,16 @@ static inline __attribute__((always_inline)) int ecs_derive_apply(
             return 1;
         }
         case ECS_XF_DNS_DIGIT_RATIO: {
+            char dnsname[ECS_DNS_NAME_MAX];
+            size_t dl = ecs__dns_wire_decode(val, vlen, dnsname, sizeof dnsname);
+            const char *name = dl > 0 ? dnsname : val;
+            size_t nlen = dl > 0 ? dl : vlen;
             size_t digits = 0;
             long v;
             int n;
-            for (size_t i = 0; i < vlen; i++)
-                if (val[i] >= '0' && val[i] <= '9') digits++;
-            v = vlen ? (long)((digits * 100 + vlen / 2) / vlen) : 0;
+            for (size_t i = 0; i < nlen; i++)
+                if (name[i] >= '0' && name[i] <= '9') digits++;
+            v = nlen ? (long)((digits * 100 + nlen / 2) / nlen) : 0;
             n = snprintf(buf, bufcap, "%ld", v);
             if (n < 0 || (size_t)n >= bufcap) return 0;
             *out = buf;
@@ -272,10 +272,14 @@ static inline __attribute__((always_inline)) int ecs_derive_apply(
             return 1;
         }
         case ECS_XF_DNS_MAX_LABEL: {
+            char dnsname[ECS_DNS_NAME_MAX];
+            size_t dl = ecs__dns_wire_decode(val, vlen, dnsname, sizeof dnsname);
+            const char *name = dl > 0 ? dnsname : val;
+            size_t nlen = dl > 0 ? dl : vlen;
             size_t maxlen = 0, cur = 0;
             int n;
-            for (size_t i = 0; i < vlen; i++) {
-                if (val[i] == '.') {
+            for (size_t i = 0; i < nlen; i++) {
+                if (name[i] == '.') {
                     cur = 0;
                 } else if (++cur > maxlen) {
                     maxlen = cur;
