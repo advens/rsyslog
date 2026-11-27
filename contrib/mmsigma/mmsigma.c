@@ -114,9 +114,10 @@ STATSCOUNTER_DEF(ctrMatchedEvents, mutCtrMatchedEvents)
  * non-zero value means some |re: rule is silently not matching. */
 STATSCOUNTER_DEF(ctrReSkipped, mutCtrReSkipped)
 
-/* hits.truncated: matcher rule-hits DROPPED because more than MMSIGMA_MAX_HITS
- * rules fired on one event (the $!sigma.count stays honest, but rules[] is
- * capped).  Incremented live by (fired - cap) per over-cap event. */
+/* hits.truncated: rule-hits left out of $!sigma.rules because more than
+ * MMSIGMA_MAX_HITS rules fired on one event ($!sigma.count stays honest, and
+ * correlation still sees every hit).  Incremented live by (fired - cap) per
+ * over-cap event. */
 STATSCOUNTER_DEF(ctrHitsTruncated, mutCtrHitsTruncated)
 
 /* corr.timestamp.fallback: with useLogTimestamp on, events with no usable
@@ -276,6 +277,12 @@ typedef struct wrkrInstanceData {
     instanceData* pData;
     sigma_eval_t* eval; /* per-worker scratch, sized for db generation evalGen */
     uint64_t evalGen;
+    /* Every rule that fires on one event, sized with eval to the ruleset's
+     * rule count: correlation sees all of them, $!sigma.rules the first
+     * MMSIGMA_MAX_HITS. */
+    sigma_hit_t* hits;
+    uint32_t* rids;
+    uint32_t hitsCap;
     mmsigma_reader_t* dbReader; /* registered on pData->dbReaders */
     /* per-worker scratch for corr_on_event fired-group value pointers, so no
      * fired-group storage is shared between concurrent workers. */
@@ -1167,6 +1174,9 @@ BEGINcreateWrkrInstance
     CODESTARTcreateWrkrInstance;
     pWrkrData->eval = NULL;
     pWrkrData->evalGen = 0;
+    pWrkrData->hits = NULL;
+    pWrkrData->rids = NULL;
+    pWrkrData->hitsCap = 0;
     pWrkrData->prevReader = NULL;
     pWrkrData->dbReader = NULL;
     if (tf_store_init(&pWrkrData->tf) != 0) ABORT_FINALIZE(RS_RET_OUT_OF_MEMORY);
@@ -1240,6 +1250,11 @@ BEGINfreeWrkrInstance
         sigma_eval_free(pWrkrData->eval);
         pWrkrData->eval = NULL;
     }
+    free(pWrkrData->hits);
+    free(pWrkrData->rids);
+    pWrkrData->hits = NULL;
+    pWrkrData->rids = NULL;
+    pWrkrData->hitsCap = 0;
     if (pWrkrData->dbReader != NULL) {
         instanceData* pData = pWrkrData->pData;
         pthread_mutex_lock(&pData->reloadMutex);
@@ -1501,6 +1516,20 @@ BEGINdoAction_NoStrings
             pWrkrData->eval = sigma_eval_create(db);
             pWrkrData->evalGen = pWrkrData->eval != NULL ? dbh->gen : 0;
             if (pWrkrData->eval == NULL) FINALIZE;
+            if (pWrkrData->hitsCap < db->n_rules) {
+                sigma_hit_t* nh = realloc(pWrkrData->hits, sizeof(*nh) * db->n_rules);
+                if (nh != NULL) pWrkrData->hits = nh;
+                uint32_t* nr = realloc(pWrkrData->rids, sizeof(*nr) * db->n_rules);
+                if (nr != NULL) pWrkrData->rids = nr;
+                if (nh == NULL || nr == NULL) {
+                    /* Rebind on the next message rather than run short. */
+                    sigma_eval_free(pWrkrData->eval);
+                    pWrkrData->eval = NULL;
+                    pWrkrData->evalGen = 0;
+                    FINALIZE;
+                }
+                pWrkrData->hitsCap = db->n_rules;
+            }
         }
 
         /* Field-resolution ctx: tf reads parsed and $! fields as terminated
@@ -1519,12 +1548,12 @@ BEGINdoAction_NoStrings
                                    .prev = prevSnap,
                                    .corr_arena = pWrkrData->corrVal,
                                    .corr_cap = sizeof(pWrkrData->corrVal)};
-        sigma_hit_t hits[MMSIGMA_MAX_HITS];
+        sigma_hit_t* hits = pWrkrData->hits;
         /* The matcher only reads fields: one mutex hold for all of them.
          * Nothing it calls takes the mutex (mmsigma_field_fn reads through
          * tf_get in locked mode). */
         tf_lock(&fctx.tf);
-        int n = sigma_eval_run(pWrkrData->eval, mmsigma_field_fn, (void*)&fctx, hits, MMSIGMA_MAX_HITS);
+        int n = sigma_eval_run(pWrkrData->eval, mmsigma_field_fn, (void*)&fctx, hits, (int)pWrkrData->hitsCap);
         tf_unlock(&fctx.tf);
         if (n <= 0) FINALIZE; /* no match, no output */
         STATSCOUNTER_INC(ctrMatchedEvents, mutCtrMatchedEvents);
@@ -1577,9 +1606,13 @@ BEGINdoAction_NoStrings
         pthread_rwlock_rdlock(&pData->corrRwlock);
         corr_engine_t* corrEng = pData->corrEngine;
         if (corrEng != NULL) {
-            uint32_t rids[MMSIGMA_MAX_HITS];
+            /* Every fired rule, not only the ones $!sigma.rules lists: an event
+             * that matches many rules must not push a correlation's base rule
+             * out of its input. */
+            uint32_t* rids = pWrkrData->rids;
             int n_rids = 0;
-            for (int i = 0; i < capped; i++) rids[n_rids++] = (uint32_t)hits[i].rule_id;
+            const int all = n < (int)pWrkrData->hitsCap ? n : (int)pWrkrData->hitsCap;
+            for (int i = 0; i < all; i++) rids[n_rids++] = (uint32_t)hits[i].rule_id;
 
             /* Correlation clock: parsed event time (configured field, then
              * well-known aliases), then rsyslog's syslog-header timestamp, all
