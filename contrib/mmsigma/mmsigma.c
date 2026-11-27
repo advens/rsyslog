@@ -120,6 +120,16 @@ STATSCOUNTER_DEF(ctrReSkipped, mutCtrReSkipped)
  * capped).  Incremented live by (fired - cap) per over-cap event. */
 STATSCOUNTER_DEF(ctrHitsTruncated, mutCtrHitsTruncated)
 
+/* values.truncated: fields with more values than the matcher keeps, so the
+ * values past the bound were not matched. values.negated_truncated: negated
+ * predicates that held on such a field, a hit the dropped values might have
+ * prevented. Both stay 0 with a libsigma that matches one value per field. */
+STATSCOUNTER_DEF(ctrValuesTruncated, mutCtrValuesTruncated)
+STATSCOUNTER_DEF(ctrValuesNegatedTruncated, mutCtrValuesNegatedTruncated)
+/* values.reevaluated: events evaluated a second time because a field the
+ * rules read is an array. */
+STATSCOUNTER_DEF(ctrValuesReevaluated, mutCtrValuesReevaluated)
+
 /* corr.timestamp.fallback: with useLogTimestamp on, events with no usable
  * event time (absent, unparseable or not finite), so the correlation used the
  * receive time. Non-zero flags a broken parser or a bad timestamp at the source. */
@@ -285,6 +295,8 @@ typedef struct wrkrInstanceData {
      * Per worker so the per-event field context stays small to initialise. */
     char corrVal[MMSIGMA_CORR_VAL_ARENA];
     enrich_reader_t* prevReader; /* this worker's view of pData->prev */
+    uint64_t valuesTruncated; /* eval's values counters already published */
+    uint64_t valuesNegatedTruncated;
 } wrkrInstanceData_t;
 
 static const char* mmsigma_corr_field_fn(void* ctx, const char* name);
@@ -885,6 +897,9 @@ typedef struct {
         const char* name;
         const char* val;
     } corr_memo[MMSIGMA_CORR_VAL_MEMO];
+    /* Set when a field the matcher asked for is a $! array leaf, which has no
+     * single value: the event is then evaluated again with every element. */
+    int saw_array;
 } mmsigma_fieldctx_t;
 
 #ifdef HAVE_LOGNORM_TURBO
@@ -940,10 +955,9 @@ static int mmsigma_src_get(void* ctx, const char* name, const char** val, size_t
 
 /* Resolve a dotted field name (e.g. "source.geo.country_name") against the
  * borrowed $! enrichment root, walking each '.'-segment as a nested-object key
- *, a couple of O(1) json_object_object_get_ex hash-gets, no per-field root
- * re-fetch.  Returns the leaf value as a C string (NUL-terminated; libfastjson
- * renders non-string leaves like ints) valid for this event, or NULL. */
-static const char* mmsigma_enrich_lookup(struct json_object* root, const char* name, size_t* out_len) {
+ * with json_object_object_get_ex hash-gets.  Returns the leaf node, of any
+ * type, or NULL; every segment before the leaf must be an object. */
+static inline struct json_object* mmsigma_enrich_node(struct json_object* root, const char* name) {
     if (root == NULL || name == NULL) return NULL;
     struct json_object* cur = root;
     const char* seg = name;
@@ -956,17 +970,43 @@ static const char* mmsigma_enrich_lookup(struct json_object* root, const char* n
         key[klen] = '\0';
         struct json_object* next = NULL;
         if (!json_object_object_get_ex(cur, key, &next)) return NULL;
-        if (dot == NULL) { /* leaf segment */
-            if (json_object_is_type(next, json_type_object) || json_object_is_type(next, json_type_array)) return NULL;
-            const char* v = json_object_get_string(next);
-            if (v == NULL) return NULL;
-            *out_len = strlen(v);
-            return v;
-        }
+        if (dot == NULL) return next; /* leaf segment */
         if (!json_object_is_type(next, json_type_object)) return NULL; /* more segments but not an object */
         cur = next;
         seg = dot + 1;
     }
+}
+
+/* A scalar node as a C string (libfastjson renders numbers and booleans), or
+ * NULL for an object, an array or a JSON null. */
+static const char* mmsigma_scalar(struct json_object* node, size_t* out_len) {
+    if (node == NULL || json_object_is_type(node, json_type_object) || json_object_is_type(node, json_type_array))
+        return NULL;
+    const char* v = json_object_get_string(node);
+    if (v == NULL) return NULL;
+    *out_len = strlen(v);
+    return v;
+}
+
+/* The scalar leaf value valid for this event, or NULL: an array leaf has no
+ * single value here (sigma_eval_run_values reads its elements). */
+static const char* mmsigma_enrich_lookup(struct json_object* root, const char* name, size_t* out_len) {
+    return mmsigma_scalar(mmsigma_enrich_node(root, name), out_len);
+}
+
+/* For a correlation key or value: a scalar leaf, or the first scalar element
+ * of an array leaf, so correlation state keeps one value per field. */
+static const char* mmsigma_enrich_lookup_first(struct json_object* root, const char* name, size_t* out_len) {
+    struct json_object* node = mmsigma_enrich_node(root, name);
+    if (node != NULL && json_object_is_type(node, json_type_array)) {
+        size_t n = json_object_array_length(node);
+        for (size_t i = 0; i < n; i++) {
+            const char* v = mmsigma_scalar(json_object_array_get_idx(node, i), out_len);
+            if (v != NULL) return v;
+        }
+        return NULL;
+    }
+    return mmsigma_scalar(node, out_len);
 }
 
 static const char* mmsigma_field_fn(void* ctx, const char* name, uint32_t name_len, size_t* out_len) {
@@ -1038,7 +1078,11 @@ static const char* mmsigma_field_fn(void* ctx, const char* name, uint32_t name_l
                  * event, not only the arena-present minority. base carries no
                  * rarity suffix, so this never recurses into this block. */
                 size_t bvlen = 0;
+                /* An array base has no prevalence on either path, so it is
+                 * no reason to evaluate the event again. */
+                int saw_array = fc->saw_array;
                 const char* bv = mmsigma_field_fn(ctx, base, (uint32_t)blen, &bvlen);
+                fc->saw_array = saw_array;
                 enrich_prev_t pv;
                 /* 1 only for a warmed table: a cold table never scores
                  * every value as rare. */
@@ -1059,12 +1103,17 @@ static const char* mmsigma_field_fn(void* ctx, const char* name, uint32_t name_l
      * tls.ja4 are emitted by mmenrich into $!, not the arena. Parsed-field
      * matching above stays zero-copy; only this enrichment minority pays the
      * cached-$! lookup. */
-    if (fc->enrich != NULL) {
-        size_t elen = 0;
-        const char* ev = mmsigma_enrich_lookup(fc->enrich, name, &elen);
-        if (ev != NULL) {
-            *out_len = elen;
-            return ev;
+    struct json_object* node = mmsigma_enrich_node(fc->enrich, name);
+    if (node != NULL) {
+        if (json_object_is_type(node, json_type_array)) {
+            fc->saw_array = 1;
+        } else {
+            size_t elen = 0;
+            const char* ev = mmsigma_scalar(node, &elen);
+            if (ev != NULL) {
+                *out_len = elen;
+                return ev;
+            }
         }
     }
     /* event.original fallback: fieldless keyword rules resolve here. A parser
@@ -1078,6 +1127,43 @@ static const char* mmsigma_field_fn(void* ctx, const char* name, uint32_t name_l
     }
     return NULL; /* field absent, not derivable, not enriched */
 }
+
+#ifdef SIGMA_HAVE_EVAL_RUN_VALUES
+/* Several-values resolver for sigma_eval_run_values. A field that resolves
+ * through mmsigma_field_fn (turbo arena, derived field, prevalence, scalar $!
+ * leaf, event.original) is one value. Otherwise a $! array leaf gives its
+ * scalar elements in order, converted as a scalar leaf is; objects, nested
+ * arrays and JSON nulls among them are skipped. The element strings belong to
+ * the $! tree and outlive the call. */
+static int mmsigma_values_fn(void* ctx, const char* name, uint32_t name_len, sigma_val_t* out, int max) {
+    mmsigma_fieldctx_t* fc = (mmsigma_fieldctx_t*)ctx;
+    size_t vlen = 0;
+    const char* v = mmsigma_field_fn(ctx, name, name_len, &vlen);
+    if (v != NULL) {
+        if (max > 0) {
+            out[0].ptr = v;
+            out[0].len = vlen;
+        }
+        return 1;
+    }
+    if (fc == NULL || fc->enrich == NULL) return 0;
+    struct json_object* node = mmsigma_enrich_node(fc->enrich, name);
+    if (node == NULL || !json_object_is_type(node, json_type_array)) return 0;
+    size_t len = json_object_array_length(node);
+    int n = 0;
+    /* Counting one past max is enough: a return above max says values were dropped. */
+    for (size_t i = 0; i < len && n <= max; i++) {
+        const char* ev = mmsigma_scalar(json_object_array_get_idx(node, i), &vlen);
+        if (ev == NULL) continue;
+        if (n < max) {
+            out[n].ptr = ev;
+            out[n].len = vlen;
+        }
+        n++;
+    }
+    return n;
+}
+#endif
 
 static const char* verdict_name(uint8_t v) {
     switch (v) {
@@ -1124,7 +1210,7 @@ static const char* mmsigma_corr_field_fn(void* ctx, const char* name) {
         }
         return dst;
     }
-    if (fc->enrich != NULL) return mmsigma_enrich_lookup(fc->enrich, name, &vlen);
+    if (fc->enrich != NULL) return mmsigma_enrich_lookup_first(fc->enrich, name, &vlen);
     return NULL;
 }
 
@@ -1580,6 +1666,8 @@ BEGINdoAction_NoStrings
         if (pWrkrData->eval == NULL || pWrkrData->evalGen != dbh->gen) {
             if (pWrkrData->eval != NULL) sigma_eval_free(pWrkrData->eval);
             pWrkrData->eval = sigma_eval_create(db);
+            pWrkrData->valuesTruncated = 0; /* a new scratch counts from 0 */
+            pWrkrData->valuesNegatedTruncated = 0;
             pWrkrData->evalGen = pWrkrData->eval != NULL ? dbh->gen : 0;
             if (pWrkrData->eval == NULL) FINALIZE;
         }
@@ -1605,6 +1693,26 @@ BEGINdoAction_NoStrings
                                    .corr_cap = sizeof(pWrkrData->corrVal)};
         sigma_hit_t hits[MMSIGMA_MAX_HITS];
         int n = sigma_eval_run(pWrkrData->eval, mmsigma_field_fn, (void*)&fctx, hits, MMSIGMA_MAX_HITS);
+#ifdef SIGMA_HAVE_EVAL_RUN_VALUES
+        /* An array field (an ECS event.type, related.ip) matches on any
+         * element. The single-value run cannot see one, so an event that holds
+         * one is evaluated again over every element and only the second result
+         * counts. Events without arrays keep the single-value cost. */
+        if (fctx.saw_array) {
+            STATSCOUNTER_INC(ctrValuesReevaluated, mutCtrValuesReevaluated);
+            fctx.derive_off = 0; /* the first run's derived values are dropped with its hits */
+            n = sigma_eval_run_values(pWrkrData->eval, mmsigma_values_fn, (void*)&fctx, hits, MMSIGMA_MAX_HITS);
+            uint64_t t = sigma_eval_values_truncated(pWrkrData->eval);
+            uint64_t nt = sigma_eval_values_negated_truncated(pWrkrData->eval);
+            if (t > pWrkrData->valuesTruncated)
+                STATSCOUNTER_ADD(ctrValuesTruncated, mutCtrValuesTruncated, (unsigned)(t - pWrkrData->valuesTruncated));
+            if (nt > pWrkrData->valuesNegatedTruncated)
+                STATSCOUNTER_ADD(ctrValuesNegatedTruncated, mutCtrValuesNegatedTruncated,
+                                 (unsigned)(nt - pWrkrData->valuesNegatedTruncated));
+            pWrkrData->valuesTruncated = t;
+            pWrkrData->valuesNegatedTruncated = nt;
+        }
+#endif
         if (n <= 0) FINALIZE; /* no match, no output */
         STATSCOUNTER_INC(ctrMatchedEvents, mutCtrMatchedEvents);
 
@@ -1820,6 +1928,15 @@ BEGINmodInit()
     STATSCOUNTER_INIT(ctrHitsTruncated, mutCtrHitsTruncated);
     CHKiRet(statsobj.AddCounter(mmsigmaStats, UCHAR_CONSTANT("hits.truncated"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
                                 &ctrHitsTruncated));
+    STATSCOUNTER_INIT(ctrValuesTruncated, mutCtrValuesTruncated);
+    CHKiRet(statsobj.AddCounter(mmsigmaStats, UCHAR_CONSTANT("values.truncated"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                &ctrValuesTruncated));
+    STATSCOUNTER_INIT(ctrValuesNegatedTruncated, mutCtrValuesNegatedTruncated);
+    CHKiRet(statsobj.AddCounter(mmsigmaStats, UCHAR_CONSTANT("values.negated_truncated"), ctrType_IntCtr,
+                                CTR_FLAG_RESETTABLE, &ctrValuesNegatedTruncated));
+    STATSCOUNTER_INIT(ctrValuesReevaluated, mutCtrValuesReevaluated);
+    CHKiRet(statsobj.AddCounter(mmsigmaStats, UCHAR_CONSTANT("values.reevaluated"), ctrType_IntCtr, CTR_FLAG_RESETTABLE,
+                                &ctrValuesReevaluated));
     STATSCOUNTER_INIT(ctrCorrTsFallback, mutCtrCorrTsFallback);
     CHKiRet(statsobj.AddCounter(mmsigmaStats, UCHAR_CONSTANT("corr.timestamp.fallback"), ctrType_IntCtr,
                                 CTR_FLAG_RESETTABLE, &ctrCorrTsFallback));
