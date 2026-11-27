@@ -64,6 +64,14 @@
 #define PREV_WINDOW_SEC (7u * 24u * 3600u)
 #define PREV_PUBLISH_MAX 200000u
 #define PREV_STUB_MIN 8u
+/* A publish that would shrink the image below half of it is held back
+ * this long after the image was last written: long enough for a counter
+ * file that lost its rows to be seeded again, short enough that counters
+ * which really shrank still reach the image. */
+#define PREV_STUB_HOLD_SEC 3600u
+/* An unchanged image is still rewritten this often, so its epoch says
+ * when it was last confirmed. */
+#define PREV_REFRESH_SEC 600u
 #define PREV_MERGE_MAX_IMAGES 64u
 #define PREV_MERGE_PATH 512
 /* A full local image is about 8 MB (200k names). Larger files are not ours. */
@@ -569,22 +577,10 @@ static uint32_t prev_next_pow2(uint32_t n) {
     return p;
 }
 
-static uint32_t prev_image_entries(const char *path) {
-    prev_header_t hdr;
-    int fd;
-    ssize_t n;
-
-    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return 0;
-    n = read(fd, &hdr, sizeof(hdr));
-    close(fd);
-    if (n != (ssize_t)sizeof(hdr)) return 0;
-    if (hdr.magic != PREV_MAGIC || hdr.version != PREV_VERSION) return 0;
-    return hdr.entry_count;
-}
-
-/* 1 when the entry bytes and the header fields that describe them match.
- * The epoch word is ignored so a quiet minute does not rewrite the image. */
+/* 1 when the entry bytes and the header fields that describe them match,
+ * and the image on disk is less than PREV_REFRESH_SEC older than the new
+ * one. The epoch word is not compared, so a quiet minute does not rewrite
+ * the image; a quiet PREV_REFRESH_SEC does. */
 static int prev_image_same(const char *path, const uint8_t *neu, size_t nlen) {
     uint8_t *old;
     struct stat st;
@@ -601,6 +597,13 @@ static int prev_image_same(const char *path, const uint8_t *neu, size_t nlen) {
     close(fd);
     if (old == MAP_FAILED) return 0;
     same = memcmp(old, neu, 28) == 0 && memcmp(old + 32, neu + 32, nlen - 32) == 0;
+    if (same) {
+        uint32_t old_epoch;
+        uint32_t neu_epoch;
+        memcpy(&old_epoch, old + offsetof(prev_header_t, epoch), sizeof(old_epoch));
+        memcpy(&neu_epoch, neu + offsetof(prev_header_t, epoch), sizeof(neu_epoch));
+        if (neu_epoch > old_epoch && neu_epoch - old_epoch >= PREV_REFRESH_SEC) same = 0;
+    }
     munmap(old, nlen);
     return same;
 }
@@ -733,14 +736,23 @@ done:
     return rc;
 }
 
-static int prev_image_too_small(const char *path, uint32_t n) {
-    uint32_t live_entries;
+/* 1 when n rows must not replace the image at path yet: they are fewer
+ * than the image holds and fewer than half of it (at least PREV_STUB_MIN),
+ * and the image was written less than PREV_STUB_HOLD_SEC ago. That is a
+ * counter file that lost its rows. An image that does not shrink is always
+ * replaced, and so is one past the hold: its counters really shrank. */
+static int prev_image_too_small(const char *path, uint32_t n, uint32_t now_sec) {
+    prev_header_t hdr;
     uint32_t floor;
 
-    live_entries = prev_image_entries(path);
-    floor = live_entries / 2u;
+    if (prev_read_header(path, &hdr) != 0) return 0;
+    if (hdr.entry_count == 0 || n >= hdr.entry_count) return 0;
+    floor = hdr.entry_count / 2u;
     if (floor < PREV_STUB_MIN) floor = PREV_STUB_MIN;
-    return live_entries > 0 && n < floor;
+    if (n >= floor) return 0;
+    /* An epoch ahead of the clock by more than the hold is not trusted. */
+    if (now_sec >= hdr.epoch) return now_sec - hdr.epoch < PREV_STUB_HOLD_SEC;
+    return hdr.epoch - now_sec < PREV_STUB_HOLD_SEC;
 }
 
 int prev_live_publish(prev_live_t *live, const char *prev_path, uint32_t now_sec, uint32_t *n_out) {
@@ -788,7 +800,7 @@ int prev_live_publish(prev_live_t *live, const char *prev_path, uint32_t now_sec
         qsort(items, n, sizeof(*items), prev_cmp_item);
         n = PREV_PUBLISH_MAX;
     }
-    if (prev_image_too_small(prev_path, n)) {
+    if (prev_image_too_small(prev_path, n, now_sec)) {
         free(items);
         return 0;
     }
@@ -1016,7 +1028,7 @@ int prev_merge_images(
     }
     if (n == 0) {
         free(acc);
-        if (prev_image_too_small(out_path, 0)) return 0;
+        if (prev_image_too_small(out_path, 0, now_sec)) return 0;
         image = prev_build_image(NULL, 0, now_sec, included, key, &image_len);
         if (image == NULL) return -1;
         rc = prev_commit_image(out_path, image, image_len, 0, n_out);
@@ -1038,7 +1050,7 @@ int prev_merge_images(
         qsort(items, filled, sizeof(*items), prev_cmp_item);
         filled = PREV_PUBLISH_MAX;
     }
-    if (prev_image_too_small(out_path, filled)) {
+    if (prev_image_too_small(out_path, filled, now_sec)) {
         free(items);
         return 0;
     }
