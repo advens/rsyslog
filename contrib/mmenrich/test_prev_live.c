@@ -411,6 +411,78 @@ static void test_stub(void) {
     free(before);
 }
 
+static uint32_t image_epoch(const char *path) {
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    prev_header_t hdr;
+    if (read_all(path, &buf, &len) != 0 || len < sizeof(hdr)) {
+        free(buf);
+        return 0;
+    }
+    memcpy(&hdr, buf, sizeof(hdr));
+    free(buf);
+    return hdr.epoch;
+}
+
+/* A small image still grows, a shrink is held back only for a while, and
+ * an unchanged image is rewritten often enough to keep its epoch fresh. */
+static void test_stub_hold(void) {
+    char image[256];
+    char key[32];
+    prev_live_t *live;
+    uint32_t n = 0;
+    uint32_t count;
+    uint16_t edges, sources;
+    uint32_t t = 1700000000u;
+    int i;
+
+    join_path(image, sizeof(image), "small.prev");
+    live = open_live("small.live");
+    prev_live_tick(live, t);
+    for (i = 0; i < 3; i++) {
+        snprintf(key, sizeof(key), "s%d.example", i);
+        prev_live_note(live, key, "10.0.0.5");
+    }
+    expect_int("publish 3", prev_live_publish(live, image, t, &n), 1);
+    for (i = 3; i < 5; i++) {
+        snprintf(key, sizeof(key), "s%d.example", i);
+        prev_live_note(live, key, "10.0.0.5");
+    }
+    expect_int("3 grows to 5", prev_live_publish(live, image, t + 60, &n), 1);
+    expect_u32("5 rows", n, 5);
+    lookup_image(image, "s4.example", &count, &edges, &sources, NULL);
+    expect_u32("new small row", count, 1);
+
+    expect_int("unchanged skipped", prev_live_publish(live, image, t + 120, &n), 0);
+    expect_u32("epoch kept", image_epoch(image), t + 60);
+    expect_int("unchanged refreshed", prev_live_publish(live, image, t + 60 + 600, &n), 1);
+    expect_u32("epoch refreshed", image_epoch(image), t + 660);
+    prev_live_close(live);
+
+    join_path(image, sizeof(image), "hold.prev");
+    live = open_live("hold20.live");
+    prev_live_tick(live, t);
+    for (i = 0; i < 20; i++) {
+        snprintf(key, sizeof(key), "h%02d.example", i);
+        prev_live_note(live, key, "10.0.0.6");
+    }
+    expect_int("publish 20 to hold", prev_live_publish(live, image, t, &n), 1);
+    prev_live_close(live);
+    live = open_live("hold4.live");
+    prev_live_tick(live, t);
+    for (i = 0; i < 4; i++) {
+        snprintf(key, sizeof(key), "k%d.example", i);
+        prev_live_note(live, key, "10.0.0.7");
+    }
+    expect_int("shrink held", prev_live_publish(live, image, t + 60, &n), 0);
+    expect_int("shrink still held", prev_live_publish(live, image, t + 3599, &n), 0);
+    expect_int("shrink past the hold", prev_live_publish(live, image, t + 3600, &n), 1);
+    expect_u32("4 rows", n, 4);
+    lookup_image(image, "h00.example", &count, &edges, &sources, NULL);
+    expect_u32("held rows gone", count, 0);
+    prev_live_close(live);
+}
+
 static void test_rotate(void) {
     char image[256];
     prev_live_t *live;
@@ -1066,6 +1138,7 @@ int main(int argc, char **argv) {
     test_conformance();
     test_sources_and_floor();
     test_stub();
+    test_stub_hold();
     test_rotate();
     test_hammer();
     test_reopen_and_seed(argc > 1 ? argv[1] : NULL);
